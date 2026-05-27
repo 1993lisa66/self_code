@@ -2,8 +2,8 @@ project:
   name: TransVoice
 
 paths:
-  input_dir: /Volumes/mvp/交易场/Lathyrus Trading原始/The Lathyrus Archive
-  output_dir: /Volumes/mvp/交易场/Lathyrus Trading原始/The Lathyrus Archive-中文
+  input_dir: input
+  output_dir: outputs
   cache_dir: cache
   log_dir: logs
   prompts_dir: prompts
