@@ -80,10 +80,22 @@ def split_into_subtitles(translated_results):
     return final_subtitles
 
 class VideoTranslationPipeline:
-    def __init__(self, config_path="config.yaml"):
+    def __init__(self, config_path="config.yaml", config_dict=None):
+        """
+        初始化 Pipeline
+        
+        Args:
+            config_path: 配置文件路径（当 config_dict 为 None 时使用）
+            config_dict: 配置字典（直接传入，避免重复加载文件）
+        """
         # 加载 YAML 配置
-        with open(config_path, 'r', encoding='utf-8') as f:
-            self.config = yaml.safe_load(f)
+        if config_dict is not None:
+            # 直接使用传入的配置字典
+            self.config = config_dict
+        else:
+            # 从文件加载配置
+            with open(config_path, 'r', encoding='utf-8') as f:
+                self.config = yaml.safe_load(f)
         
         # 配置日志系统
         log_dir = self.config['paths']['log_dir']

@@ -33,6 +33,9 @@ if os.path.exists(ffmpeg_path):
 
 import glob
 import nltk
+from multiprocessing import Pool, cpu_count
+from functools import partial
+import time
 
 from modules.utils.patch_torch import apply_torch_patch
 apply_torch_patch()
@@ -70,35 +73,74 @@ def clear_directory(directory_path):
         os.makedirs(directory_path, exist_ok=True)
         print(f"[OK] 已创建目录: {directory_path}")
 
+def process_single_video(video_file, input_path, config_dict):
+    """处理单个视频的函数（用于多进程）
+    
+    Args:
+        video_file: 视频文件路径
+        input_path: 输入目录路径
+        config_dict: 配置字典（从主进程传递，避免重复加载）
+    """
+    from pipeline import VideoTranslationPipeline
+    
+    filename = os.path.basename(video_file)
+    
+    # 计算相对路径
+    if os.path.isdir(input_path):
+        rel_path = os.path.relpath(video_file, input_path)
+        sub_dir = os.path.dirname(rel_path)
+    else:
+        sub_dir = ""
+
+    print(f"\n>>> 正在处理 [{filename}] ...")
+    try:
+        # 使用传入的配置创建 Pipeline 实例
+        # 注意：每个进程仍需创建自己的 Pipeline，因为模型不能跨进程共享
+        # 但 Pipeline 内部使用了单例模式缓存模型，同一进程处理多个视频时会复用
+        pipeline = VideoTranslationPipeline(config_dict=config_dict)
+        # 运行 Pipeline，传入 sub_dir 以保持目录结构
+        pipeline.run(video_file, sub_dir=sub_dir)
+        print(f"✅ DONE: [{filename}] 处理完成！")
+        return {"file": filename, "status": "success"}
+    except Exception as e:
+        logger.error(f"处理视频 {filename} 时发生异常: {e}")
+        print(f"❌ FAILED: [{filename}] 处理失败，请查看日志。")
+        return {"file": filename, "status": "failed", "error": str(e)}
+
 def main():
     # 清空 cache 和 outputs 目录
     cache_dir = os.path.join(project_root, "cache")
     outputs_dir = os.path.join(project_root, "outputs")
-    
+    logs_dir = os.path.join(project_root, "logs")
+
     print("\n>>> 清理缓存和输出目录...")
     clear_directory(cache_dir)
     clear_directory(outputs_dir)
+    clear_directory(logs_dir)
     print()
 
     # 默认视频扩展名
     VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.flv')
 
-    # 0. 显示配置信息
+    # 0. 显示配置信息（只执行一次）
     print("="*60)
     print("📋 配置信息检查")
     print("="*60)
     
+    # 创建 Pipeline 实例以加载配置（只加载一次）
     pipeline = VideoTranslationPipeline()
     config = pipeline.config
     
     input_dir = config['paths'].get('input_dir', 'input')
     output_dir = config['paths'].get('output_dir', 'outputs')
     cache_dir = config['paths'].get('cache_dir', 'cache')
-    
+    logs_dir = config['paths'].get('log_dir', 'logs')
+
     print(f"📂 输入目录: {input_dir}")
     print(f"📤 输出目录: {output_dir}")
     print(f"💾 缓存目录: {cache_dir}")
-    
+    print(f"💾 日志目录: {logs_dir}")
+
     # 检查目录是否存在（输入目录必须存在，输出和缓存目录会自动创建）
     if not os.path.exists(input_dir):
         print(f"\n⚠️  警告: 输入目录不存在: {input_dir}")
@@ -107,8 +149,6 @@ def main():
         print(f"✅ 输入目录已存在")
     
     print("="*60 + "\n")
-
-    # 1. 初始化 Pipeline 以获取配置
 
     # 2. 从配置读取输入路径，如果没有则默认使用 "input"
     input_path = config['paths'].get('input_dir', 'input')
@@ -154,25 +194,61 @@ def main():
 
     print(f"共找到 {len(video_files)} 个视频文件待处理。")
 
-    # 批量处理
-    for video_file in video_files:
-        filename = os.path.basename(video_file)
-        
-        # 计算相对路径
-        if os.path.isdir(input_path):
-            rel_path = os.path.relpath(video_file, input_path)
-            sub_dir = os.path.dirname(rel_path)
-        else:
-            sub_dir = ""
-
-        print(f"\n>>> 正在处理 [{filename}] ...")
-        try:
-            # 运行 Pipeline，传入 sub_dir 以保持目录结构
-            pipeline.run(video_file, sub_dir=sub_dir)
-            print(f"DONE: [{filename}] 处理完成！")
-        except Exception as e:
-            logger.error(f"处理视频 {filename} 时发生异常: {e}")
-            print(f"FAILED: [{filename}] 处理失败，请查看日志。")
+    # 从配置文件读取并行处理参数（支持环境变量覆盖）
+    video_config = config.get('global', {}).get('video_processing', {})
+    max_workers = int(os.environ.get(
+        'MAX_CONCURRENT_VIDEOS', 
+        str(video_config.get('max_parallel_videos', 3))
+    ))
+    max_workers = min(max_workers, len(video_files), cpu_count())  # 不超过CPU核心数和文件数
+    
+    print(f"\n🚀 启动多进程处理，并行数: {max_workers}")
+    print(f"💡 提示: 可在 config.yaml 中配置 global.video_processing.max_parallel_videos")
+    
+    # 配置 API 速率限制（优先从配置文件读取，支持环境变量覆盖）
+    api_limits = video_config.get('api_rate_limits', {})
+    llm_rate = int(os.environ.get(
+        'LLM_API_RATE', 
+        str(api_limits.get('llm_per_minute', 15))
+    ))
+    tts_rate = int(os.environ.get(
+        'TTS_API_RATE', 
+        str(api_limits.get('tts_per_minute', 30))
+    ))
+    
+    from modules.utils.rate_limiter import set_llm_rate_limit, set_tts_rate_limit
+    set_llm_rate_limit(max_calls=llm_rate, time_window=60.0)
+    set_tts_rate_limit(max_calls=tts_rate, time_window=60.0)
+    
+    # 使用进程池并行处理
+    start_time = time.time()
+    
+    # 创建偏函数，传递配置字典（避免子进程重复加载配置文件）
+    process_func = partial(process_single_video, input_path=input_path, config_dict=config)
+    
+    with Pool(processes=max_workers) as pool:
+        results = pool.map(process_func, video_files)
+    
+    elapsed_time = time.time() - start_time
+    
+    # 统计结果
+    success_count = sum(1 for r in results if r['status'] == 'success')
+    failed_count = sum(1 for r in results if r['status'] == 'failed')
+    
+    print(f"\n{'='*60}")
+    print(f"📊 处理完成统计:")
+    print(f"   - 总计: {len(video_files)} 个视频")
+    print(f"   - 成功: {success_count} 个")
+    print(f"   - 失败: {failed_count} 个")
+    print(f"   - 总耗时: {elapsed_time:.2f} 秒 ({elapsed_time/60:.2f} 分钟)")
+    print(f"{'='*60}")
+    
+    # 显示失败的文件
+    if failed_count > 0:
+        print(f"\n❌ 失败的文件:")
+        for r in results:
+            if r['status'] == 'failed':
+                print(f"   - {r['file']}: {r.get('error', '未知错误')}")
 
 if __name__ == "__main__":
     main()

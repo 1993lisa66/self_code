@@ -16,6 +16,11 @@ global:
     english_translator: 15
     tts_text_processor: 20
     chapter_generator: 1
+  video_processing:
+    max_parallel_videos: 8  # 同时处理的视频数量 (1-5)
+    api_rate_limits:
+      llm_per_minute: 15  # LLM API 每分钟最大调用次数
+      tts_per_minute: 30  # TTS API 每分钟最大调用次数
   auto_cleanup_cache: true  # 处理完每个视频后自动清理缓存
 
 audio:

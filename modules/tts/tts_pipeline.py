@@ -5,6 +5,8 @@ import aiofiles
 import edge_tts
 import subprocess
 from loguru import logger
+from pydub import AudioSegment
+from modules.utils.rate_limiter import wait_for_tts_api
 
 # 必须在导入 pydub 之前设置 FFmpeg 路径
 from modules.utils.ffmpeg_utils import get_ffmpeg_exe, get_ffprobe_exe
@@ -30,7 +32,6 @@ def get_media_duration(media_path):
         
         # 方法1: 尝试使用 pydub (更可靠)
         try:
-            from pydub import AudioSegment
             audio = AudioSegment.from_file(media_path)
             duration = len(audio) / 1000.0  # 转换为秒
             logger.info(f"媒体文件时长: {os.path.basename(media_path)} -> {duration:.2f}s")
@@ -96,6 +97,9 @@ async def _generate_edge_tts(text, voice, path, max_retries=2):
     """单条语音合成任务（带重试机制）"""
     for attempt in range(max_retries + 1):
         try:
+            # API 速率限制检查
+            wait_for_tts_api()
+            
             abs_path = os.path.abspath(path)
             # 确保目录存在
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)

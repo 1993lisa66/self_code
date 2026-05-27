@@ -124,11 +124,31 @@ def run_ffmpeg_command(cmd: list, description: str = "FFmpeg 命令",
     """
     logger.debug(f"执行 {description}: {' '.join(cmd[:5])}...")
     
+    # 为多进程环境准备环境变量
+    env = os.environ.copy()
+    
+    # 确保 FFmpeg 的动态库路径被正确设置（macOS 特别需要）
+    ffmpeg_dir = os.path.dirname(cmd[0]) if cmd else ""
+    if ffmpeg_dir and os.path.exists(ffmpeg_dir):
+        # 添加 FFmpeg bin 目录到 PATH
+        env["PATH"] = ffmpeg_dir + os.pathsep + env.get("PATH", "")
+        
+        # macOS: 设置动态库路径
+        if os.name != 'nt':  # 非 Windows
+            lib_dir = os.path.join(os.path.dirname(ffmpeg_dir), "lib")
+            if os.path.exists(lib_dir):
+                env["DYLD_LIBRARY_PATH"] = lib_dir + os.pathsep + env.get("DYLD_LIBRARY_PATH", "")
+            # 也尝试 homebrew 的路径
+            brew_lib = "/opt/homebrew/Cellar/ffmpeg/8.1.1/lib"
+            if os.path.exists(brew_lib):
+                env["DYLD_LIBRARY_PATH"] = brew_lib + os.pathsep + env.get("DYLD_LIBRARY_PATH", "")
+    
     result = subprocess.run(
         cmd,
         capture_output=capture_output,
         text=not capture_output,  # 如果是二进制输出，不使用文本模式
-        creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+        env=env  # 使用自定义环境变量
     )
     
     if result.returncode != 0:
