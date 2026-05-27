@@ -2,6 +2,7 @@ import os
 import yaml
 import json
 import time
+import shutil
 from loguru import logger
 
 # 导入功能模块
@@ -120,13 +121,23 @@ class VideoTranslationPipeline:
         output_base_dir = os.path.abspath(self.config['paths']['output_dir'])
         target_output_dir = os.path.join(output_base_dir, sub_dir, base_name)
         if not os.path.exists(target_output_dir):
-            os.makedirs(target_output_dir, exist_ok=True)
+            try:
+                os.makedirs(target_output_dir, exist_ok=True)
+                logger.info(f"创建输出目录: {target_output_dir}")
+            except Exception as e:
+                logger.error(f"无法创建输出目录 {target_output_dir}: {e}")
+                raise
             
         # 缓存目录也保持结构 (绝对路径 + 以文件名命名的独立文件夹)
         cache_base_dir = os.path.abspath(self.config['paths']['cache_dir'])
         target_cache_dir = os.path.join(cache_base_dir, sub_dir, base_name)
         if not os.path.exists(target_cache_dir):
-            os.makedirs(target_cache_dir, exist_ok=True)
+            try:
+                os.makedirs(target_cache_dir, exist_ok=True)
+                logger.info(f"创建缓存目录: {target_cache_dir}")
+            except Exception as e:
+                logger.error(f"无法创建缓存目录 {target_cache_dir}: {e}")
+                raise
             
         # 用于保存全量结果的字典
         final_result_data = {
@@ -295,11 +306,23 @@ class VideoTranslationPipeline:
             # STEP 10: 导出全量结果与摘要
             self._export_final_outputs(base_name, final_result_data, target_output_dir)
             
+            # STEP 11: 清理缓存（根据配置）
+            if self.config.get('global', {}).get('auto_cleanup_cache', True):
+                self._cleanup_cache(target_cache_dir, base_name)
+            else:
+                logger.info(f"缓存已保留: {target_cache_dir}")
+            
             logger.success(f"视频 [{base_name}] 处理完成！")
             return final_video
             
         except Exception as e:
             logger.error(f"处理视频 {video_path} 时 Pipeline 崩溃: {e}")
+            # 即使失败也尝试清理缓存（如果配置了自动清理）
+            if self.config.get('global', {}).get('auto_cleanup_cache', True):
+                try:
+                    self._cleanup_cache(target_cache_dir, base_name, success=False)
+                except:
+                    pass
             raise e
 
     def _export_final_outputs(self, base_name, data, target_output_dir):
@@ -399,3 +422,47 @@ class VideoTranslationPipeline:
             f.write("\n".join(summary_lines))
         
         logger.info(f"已导出摘要和全量数据到 {target_output_dir}")
+
+    def _cleanup_cache(self, cache_dir, video_name, success=True):
+        """
+        清理视频处理后的缓存目录
+        
+        Args:
+            cache_dir: 缓存目录路径
+            video_name: 视频名称（用于日志）
+            success: 是否成功处理完成
+        """
+        if not os.path.exists(cache_dir):
+            return
+        
+        try:
+            # 计算缓存大小
+            total_size = 0
+            file_count = 0
+            for dirpath, dirnames, filenames in os.walk(cache_dir):
+                for filename in filenames:
+                    filepath = os.path.join(dirpath, filename)
+                    total_size += os.path.getsize(filepath)
+                    file_count += 1
+            
+            size_mb = total_size / (1024 * 1024)
+            
+            if success:
+                logger.info(f"STEP 11: 清理缓存")
+                logger.info(f"  - 视频: {video_name}")
+                logger.info(f"  - 缓存文件数: {file_count}")
+                logger.info(f"  - 缓存大小: {size_mb:.2f} MB")
+                logger.info(f"  - 缓存目录: {cache_dir}")
+                
+                # 删除整个缓存目录
+                shutil.rmtree(cache_dir)
+                logger.success(f"✅ 缓存已清理，释放 {size_mb:.2f} MB 空间")
+            else:
+                logger.warning(f"⚠️  视频处理失败，清理缓存")
+                logger.info(f"  - 视频: {video_name}")
+                logger.info(f"  - 缓存大小: {size_mb:.2f} MB")
+                shutil.rmtree(cache_dir)
+                logger.info(f"✅ 失败任务的缓存已清理")
+                
+        except Exception as e:
+            logger.warning(f"清理缓存时出错: {e}（不影响主流程）")

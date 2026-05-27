@@ -8,16 +8,10 @@ from loguru import logger
 
 # 必须在导入 pydub 之前设置 FFmpeg 路径
 from modules.utils.ffmpeg_utils import get_ffmpeg_exe, get_ffprobe_exe
+from modules.utils.media_utils import get_media_duration, validate_media_file
 
 ffmpeg_exe = get_ffmpeg_exe()
 ffprobe_exe = get_ffprobe_exe()
-
-# 配置 pydub 使用项目的 FFmpeg 和 FFprobe（在导入前设置）
-import pydub
-pydub.AudioSegment.converter = ffmpeg_exe
-pydub.AudioSegment.ffprobe = ffprobe_exe
-
-from pydub import AudioSegment
 
 logger.info(f"TTS 模块使用的 FFmpeg: {ffmpeg_exe}")
 logger.info(f"TTS 模块使用的 FFprobe: {ffprobe_exe}")
@@ -44,30 +38,54 @@ def get_media_duration(media_path):
         except Exception as e:
             logger.debug(f"Pydub 获取时长失败: {e}，尝试 ffprobe...")
         
-        # 方法2: 使用 ffprobe (备用)
+        # 方法2: 使用 ffprobe 的简化命令（兼容性更好）
         cmd = [
             ffprobe_exe, "-v", "error",
+            "-i", media_path,
             "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            media_path
+            "-of", "csv=p=0"
         ]
         result = subprocess.run(
             cmd, 
             capture_output=True, 
-            text=False,  # 使用字节模式避免编码问题
+            text=True,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         )
         
         if result.returncode != 0:
-            stderr_text = result.stderr.decode('utf-8', errors='replace') if result.stderr else "Unknown error"
-            logger.error(f"ffprobe 执行失败: {stderr_text[:200]}")
+            logger.error(f"ffprobe 执行失败: {result.stderr[:200]}")
+            # 方法3: 最后的备用方案 - 使用 ffprobe 的基本输出
+            try:
+                cmd_fallback = [ffprobe_exe, "-i", media_path]
+                result_fallback = subprocess.run(
+                    cmd_fallback,
+                    capture_output=True,
+                    text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+                )
+                # 从 stderr 中解析时长
+                import re
+                match = re.search(r'Duration: (\d+):(\d+):(\d+\.\d+)', result_fallback.stderr)
+                if match:
+                    hours = int(match.group(1))
+                    minutes = int(match.group(2))
+                    seconds = float(match.group(3))
+                    duration = hours * 3600 + minutes * 60 + seconds
+                    logger.info(f"媒体文件时长 (解析): {os.path.basename(media_path)} -> {duration:.2f}s")
+                    return duration
+            except Exception as e2:
+                logger.error(f"备用方案也失败: {e2}")
             return None
         
         # 解码输出并转换为浮点数
-        duration_str = result.stdout.decode('utf-8', errors='replace').strip()
-        duration = float(duration_str)
-        logger.info(f"媒体文件时长: {os.path.basename(media_path)} -> {duration:.2f}s")
-        return duration
+        duration_str = result.stdout.strip()
+        if duration_str:
+            duration = float(duration_str)
+            logger.info(f"媒体文件时长: {os.path.basename(media_path)} -> {duration:.2f}s")
+            return duration
+        else:
+            logger.error("ffprobe 返回空结果")
+            return None
     except Exception as e:
         logger.error(f"获取媒体时长失败: {e}")
         import traceback
@@ -82,17 +100,25 @@ async def _generate_edge_tts(text, voice, path, max_retries=2):
             # 确保目录存在
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
             
+            # 检查文本是否为空
+            if not text or not text.strip():
+                logger.error(f"文本为空，跳过合成: {path}")
+                return False
+            
+            logger.debug(f"开始合成片段 {os.path.basename(path)}: '{text[:50]}...'")
             communicate = edge_tts.Communicate(text, voice)
             await communicate.save(abs_path)
             
-            if os.path.exists(abs_path) and os.path.getsize(abs_path) > 100:
+            if validate_media_file(abs_path):
+                logger.debug(f"片段 {os.path.basename(path)} 合成成功: {os.path.getsize(abs_path)} bytes")
                 return True
             else:
+                file_size = os.path.getsize(abs_path) if os.path.exists(abs_path) else 0
                 if attempt < max_retries:
-                    logger.warning(f"Edge-TTS 生成文件无效，重试 {attempt + 1}/{max_retries}: {abs_path}")
+                    logger.warning(f"Edge-TTS 生成文件无效 ({file_size} bytes)，重试 {attempt + 1}/{max_retries}: {abs_path}")
                     continue
                 else:
-                    logger.error(f"Edge-TTS 生成文件无效 (可能网络问题或文本为空): {abs_path}")
+                    logger.error(f"Edge-TTS 生成文件无效 ({file_size} bytes, 可能网络问题或文本为空): {abs_path}")
                     return False
         except Exception as e:
             if attempt < max_retries:
@@ -100,6 +126,8 @@ async def _generate_edge_tts(text, voice, path, max_retries=2):
                 await asyncio.sleep(1)  # 等待 1 秒后重试
             else:
                 logger.error(f"Edge-TTS 合成失败 ({voice}): {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
                 return False
     return False
 
@@ -186,10 +214,7 @@ async def generate_tts(translated_results, output_dir="cache/tts", voice="zh-CN-
 
     logger.info(f"开始异步合成 {len(translated_results)} 段语音...")
     
-    # 进度追踪
-    completed_count = 0
-    total_count = len(tasks)
-    
+    # 构建任务列表
     for i, seg in enumerate(translated_results):
         text = seg.get("tts_text") or seg.get("translated_text") or seg.get("text")
         if not text or not text.strip():
@@ -199,9 +224,14 @@ async def generate_tts(translated_results, output_dir="cache/tts", voice="zh-CN-
         temp_path = os.path.join(output_dir, f"temp_{i}.mp3")
         temp_files_to_merge.append((seg, temp_path))
         tasks.append((i, text, temp_path))
+    
+    total_count = len(tasks)  # 修复：在添加任务后计算总数
+    logger.info(f"有效任务数: {total_count}")
 
     # 并发运行（带进度显示）
     import sys
+    
+    completed_count = 0  # 移到正确的位置
     
     async def task_with_progress(task_info, idx_in_tasks):
         result = await sem_task(task_info)
@@ -245,7 +275,7 @@ async def generate_tts(translated_results, output_dir="cache/tts", voice="zh-CN-
 
         # 2. 处理 TTS 音频片段
         audio_duration = 0.0
-        if os.path.exists(path) and os.path.getsize(path) > 100:
+        if validate_media_file(path):
             audio_duration = get_media_duration(path)
             
         if audio_duration is not None and audio_duration > 0.1:
@@ -273,7 +303,9 @@ async def generate_tts(translated_results, output_dir="cache/tts", voice="zh-CN-
     if not valid_temp_files:
         logger.error("没有成功的 TTS 片段可供合并，生成基础静音文件")
         total_duration = current_time if current_time > 0 else 10.0
-        subprocess.run([ffmpeg_exe, "-y", "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo:d={total_duration}", "-t", f"{total_duration}", full_output_path], check=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        from modules.utils.media_utils import run_ffmpeg_command
+        cmd = [ffmpeg_exe, "-y", "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo:d={total_duration}", "-t", f"{total_duration}", full_output_path]
+        run_ffmpeg_command(cmd, "生成静音音频", check=True)
     else:
         # 使用 Pydub 进行合并，确保音频流连续无卡顿
         success = merge_audio_with_pydub(valid_temp_files, full_output_path)

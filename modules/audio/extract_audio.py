@@ -1,7 +1,7 @@
 import os
-import subprocess
 from loguru import logger
 from modules.utils.ffmpeg_utils import get_ffmpeg_exe
+from modules.utils.media_utils import run_ffmpeg_command
 
 ffmpeg_exe = get_ffmpeg_exe()
 
@@ -34,17 +34,11 @@ def extract_audio(video_path, output_dir="cache/audio", sample_rate=16000):
             output_path
         ]
         
-        # 运行命令，捕获输出（使用字节模式避免编码问题）
-        result = subprocess.run(
-            cmd, 
-            capture_output=True, 
-            text=False,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-        )
+        # 运行命令，捕获输出
+        result = run_ffmpeg_command(cmd, f"音频提取: {base_name}", capture_output=True)
         
         if result.returncode != 0:
-            # 手动解码错误输出
-            stderr_text = result.stderr.decode('utf-8', errors='replace') if result.stderr else "Unknown error"
+            stderr_text = result.stderr.decode('utf-8', errors='replace') if isinstance(result.stderr, bytes) else result.stderr
             logger.error(f"FFmpeg 报错: {stderr_text[:500]}")
             raise Exception(f"FFmpeg 提取音频失败")
 

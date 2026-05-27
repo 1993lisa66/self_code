@@ -83,9 +83,32 @@ def main():
     # 默认视频扩展名
     VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.flv')
 
-    # 1. 初始化 Pipeline 以获取配置
+    # 0. 显示配置信息
+    print("="*60)
+    print("📋 配置信息检查")
+    print("="*60)
+    
     pipeline = VideoTranslationPipeline()
     config = pipeline.config
+    
+    input_dir = config['paths'].get('input_dir', 'input')
+    output_dir = config['paths'].get('output_dir', 'outputs')
+    cache_dir = config['paths'].get('cache_dir', 'cache')
+    
+    print(f"📂 输入目录: {input_dir}")
+    print(f"📤 输出目录: {output_dir}")
+    print(f"💾 缓存目录: {cache_dir}")
+    
+    # 检查目录是否存在（输入目录必须存在，输出和缓存目录会自动创建）
+    if not os.path.exists(input_dir):
+        print(f"\n⚠️  警告: 输入目录不存在: {input_dir}")
+        print(f"   程序将尝试自动创建该目录...")
+    else:
+        print(f"✅ 输入目录已存在")
+    
+    print("="*60 + "\n")
+
+    # 1. 初始化 Pipeline 以获取配置
 
     # 2. 从配置读取输入路径，如果没有则默认使用 "input"
     input_path = config['paths'].get('input_dir', 'input')
@@ -94,12 +117,22 @@ def main():
     if len(sys.argv) > 1:
         input_path = sys.argv[1]
 
+    # 4. 验证输入路径
     if not os.path.exists(input_path):
-        print(f"错误: 找不到路径 {input_path}")
-        # 尝试创建目录（如果是默认路径）
-        if input_path == config['paths'].get('input_dir'):
-            os.makedirs(input_path, exist_ok=True)
-            print(f"已自动创建目录: {input_path}，请将视频放入该目录后重试。")
+        logger.error(f"错误: 找不到路径 {input_path}")
+        print(f"\n❌ 错误: 找不到路径 {input_path}")
+        
+        # 尝试创建目录（如果是默认路径或配置的路径）
+        if input_path in [config['paths'].get('input_dir'), 'input']:
+            try:
+                os.makedirs(input_path, exist_ok=True)
+                print(f"✅ 已自动创建目录: {input_path}")
+                print(f"请将视频放入该目录后重试。\n")
+            except Exception as e:
+                print(f"无法创建目录: {e}\n")
+        else:
+            print(f"请检查配置文件 config.yaml 中的 paths.input_dir 设置是否正确。\n")
+            print(f"当前配置: {config['paths'].get('input_dir')}")
         return
 
     # 收集待处理的视频文件

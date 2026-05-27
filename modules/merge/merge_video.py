@@ -2,32 +2,13 @@ import os
 import subprocess
 from loguru import logger
 from modules.utils.ffmpeg_utils import get_ffmpeg_exe, get_ffprobe_exe
+from modules.utils.media_utils import get_media_duration, run_ffmpeg_command
 
 ffmpeg_exe = get_ffmpeg_exe()
 ffprobe_exe = get_ffprobe_exe()
 
 
-def get_duration(path):
-    """获取媒体时长"""
-    try:
-        cmd = [
-            ffprobe_exe,
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            path
-        ]
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
-        if result.returncode != 0:
-            return 0
-        return float(result.stdout.strip() or 0)
-    except Exception:
-        return 0
+
 
 def merge_video(video_path, tts_audio, srt_path, output_dir="outputs", config=None):
     """
@@ -46,8 +27,8 @@ def merge_video(video_path, tts_audio, srt_path, output_dir="outputs", config=No
     output_path = os.path.join(output_dir, f"{base_name}_translated.mp4")
 
     # 获取时长
-    v_dur = get_duration(video_path)
-    a_dur = get_duration(tts_audio)
+    v_dur = get_media_duration(video_path) or 0
+    a_dur = get_media_duration(tts_audio) or 0
     
     logger.info(f"视频时长: {v_dur:.2f}s, 音频时长: {a_dur:.2f}s")
     
@@ -124,10 +105,10 @@ def merge_video(video_path, tts_audio, srt_path, output_dir="outputs", config=No
 
     try:
         logger.info(f"运行合成指令...")
-        result = subprocess.run(cmd, capture_output=True, text=False)
+        result = run_ffmpeg_command(cmd, "视频合成", capture_output=True)
         
         if result.returncode != 0:
-            stderr_text = result.stderr.decode('utf-8', errors='replace')
+            stderr_text = result.stderr.decode('utf-8', errors='replace') if isinstance(result.stderr, bytes) else result.stderr
             logger.error(f"FFmpeg 合成指令执行失败，返回码: {result.returncode}")
             logger.error(f"FFmpeg 错误输出:\n{stderr_text[:500]}")
             
@@ -145,7 +126,7 @@ def merge_video(video_path, tts_audio, srt_path, output_dir="outputs", config=No
                         continue
                     cmd_no_sub.append(c)
                 
-                result_no_sub = subprocess.run(cmd_no_sub, capture_output=True, text=False)
+                result_no_sub = run_ffmpeg_command(cmd_no_sub, "无字幕视频合成", capture_output=True)
                 if result_no_sub.returncode == 0:
                     logger.warning("已生成不带字幕的视频作为回退。")
                     return output_path
@@ -178,11 +159,11 @@ def merge_video(video_path, tts_audio, srt_path, output_dir="outputs", config=No
             ]
             
             try:
-                result_ext = subprocess.run(cmd_ext, capture_output=True, text=False)
+                result_ext = run_ffmpeg_command(cmd_ext, "软字幕版本生成", capture_output=True)
                 if result_ext.returncode == 0:
                     logger.success(f"✓ 软字幕版本生成成功: {external_sub_path}")
                 else:
-                    stderr_ext = result_ext.stderr.decode('utf-8', errors='replace')
+                    stderr_ext = result_ext.stderr.decode('utf-8', errors='replace') if isinstance(result_ext.stderr, bytes) else result_ext.stderr
                     logger.warning(f"软字幕版本生成失败: {stderr_ext[:200]}")
             except Exception as e:
                 logger.warning(f"生成软字幕版本时出错: {e}")

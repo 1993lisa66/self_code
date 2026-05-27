@@ -2,8 +2,8 @@ project:
   name: TransVoice
 
 paths:
-  input_dir: input
-  output_dir: outputs
+  input_dir: /Volumes/mvp/交易场/Lathyrus Trading原始/The Lathyrus Archive
+  output_dir: /Volumes/mvp/交易场/Lathyrus Trading原始/The Lathyrus Archive-中文
   cache_dir: cache
   log_dir: logs
   prompts_dir: prompts
@@ -16,6 +16,7 @@ global:
     english_translator: 15
     tts_text_processor: 20
     chapter_generator: 1
+  auto_cleanup_cache: true  # 处理完每个视频后自动清理缓存
 
 audio:
   sample_rate: 16000
