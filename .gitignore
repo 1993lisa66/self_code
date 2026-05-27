@@ -1,0 +1,8 @@
+.idea
+.git
+.DS_Store
+
+/logs/
+/input/
+/outputs/
+/cache/
