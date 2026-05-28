@@ -137,7 +137,7 @@ def check_output_exists(video_path, mode, output_dir):
     return False
 
 
-def process_video_unified(video_path, config, mode='subtitle_only', input_dir='', output_dir=''):
+def process_video_unified(video_path, config, mode='subtitle_only', input_dir='', output_dir='', batch_name=None):
     """
     统一视频处理函数
     
@@ -152,6 +152,7 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
             - tts_with_subtitle: 生成中文配音并合并字幕到视频
         input_dir: 输入目录
         output_dir: 输出目录
+        batch_name: 批次名称（可选，用于加载批次专属提示词）
     
     Returns:
         dict: 处理结果
@@ -245,13 +246,21 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
         if config.get('llm', {}).get('api_key'):
             logger.info("\n[STEP 4/6] LLM 修正字幕文本...")
             try:
-                # 加载提示词模板
-                prompts_dir = config['paths'].get('prompts_dir', 'prompts')
+                # 确定提示词目录（优先使用批次提示词）
+                if batch_name:
+                    batches_dir = config.get('paths', {}).get('batches_dir', os.path.join(project_root, "config", "batches"))
+                    prompts_dir = os.path.join(batches_dir, batch_name, "prompts")
+                    logger.info(f"  使用批次提示词: {batch_name}")
+                else:
+                    prompts_dir = config['paths'].get('prompts_dir', 'config/prompts')
+                    logger.info(f"  使用全局提示词")
+                
                 asr_fix_path = os.path.join(prompts_dir, 'asr_fix.txt')
                 prompt_template = ""
                 if os.path.exists(asr_fix_path):
                     with open(asr_fix_path, 'r', encoding='utf-8') as f:
                         prompt_template = f.read()
+                    logger.info(f"  加载提示词模板: {os.path.basename(asr_fix_path)}")
                 
                 fused_results = fuse_asr_result(
                     asr_results,
@@ -276,8 +285,13 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
             logger.info("\n[STEP 5/6] 翻译字幕...")
             target_lang = 'zh' if mode == 'subtitle_chinese' else 'en'
             
-            # 加载翻译提示词
-            prompts_dir = config['paths'].get('prompts_dir', 'prompts')
+            # 确定提示词目录（优先使用批次提示词）
+            if batch_name:
+                batches_dir = config.get('paths', {}).get('batches_dir', os.path.join(project_root, "config", "batches"))
+                prompts_dir = os.path.join(batches_dir, batch_name, "prompts")
+            else:
+                prompts_dir = config['paths'].get('prompts_dir', 'config/prompts')
+            
             translation_path = os.path.join(prompts_dir, 'translation.txt')
             prompt_template = ""
             if os.path.exists(translation_path):
@@ -341,7 +355,13 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
             
             # 如果没有翻译结果，先翻译
             if 'translated_results' not in locals():
-                prompts_dir = config['paths'].get('prompts_dir', 'prompts')
+                # 确定提示词目录（优先使用批次提示词）
+                if batch_name:
+                    batches_dir = config.get('paths', {}).get('batches_dir', os.path.join(project_root, "config", "batches"))
+                    prompts_dir = os.path.join(batches_dir, batch_name, "prompts")
+                else:
+                    prompts_dir = config['paths'].get('prompts_dir', 'config/prompts')
+                
                 translation_path = os.path.join(prompts_dir, 'translation.txt')
                 prompt_template = ""
                 if os.path.exists(translation_path):
@@ -359,7 +379,13 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
             logger.info("TTS 文本预处理...")
             from modules.tts.text_processor import process_tts_text
             
-            prompts_dir = config['paths'].get('prompts_dir', 'prompts')
+            # 确定提示词目录（优先使用批次提示词）
+            if batch_name:
+                batches_dir = config.get('paths', {}).get('batches_dir', os.path.join(project_root, "config", "batches"))
+                prompts_dir = os.path.join(batches_dir, batch_name, "prompts")
+            else:
+                prompts_dir = config['paths'].get('prompts_dir', 'config/prompts')
+            
             tts_prep_path = os.path.join(prompts_dir, 'tts_prep.txt')
             prompt_template = ""
             if os.path.exists(tts_prep_path):
@@ -447,13 +473,13 @@ def process_single_video(args):
     包装函数，用于多进程调用
     
     Args:
-        args: (video_path, config, mode, input_dir, output_dir) 元组
+        args: (video_path, config, mode, input_dir, output_dir, batch_name) 元组
     
     Returns:
         dict: 处理结果
     """
-    video_path, config, mode, input_dir, output_dir = args
-    return process_video_unified(video_path, config, mode, input_dir, output_dir)
+    video_path, config, mode, input_dir, output_dir, batch_name = args
+    return process_video_unified(video_path, config, mode, input_dir, output_dir, batch_name)
 
 
 def main(input_path=None, output_dir=None, mode=None, batch_name=None):
@@ -619,8 +645,8 @@ def main(input_path=None, output_dir=None, mode=None, batch_name=None):
     logger.info(f"  - 并行进程数: {max_workers}")
     logger.info(f"\n")
     
-    # 准备参数列表
-    task_args = [(video_file, config, final_mode, final_input_path, final_output_dir) for video_file in video_files]
+    # 准备参数列表（包含 batch_name）
+    task_args = [(video_file, config, final_mode, final_input_path, final_output_dir, final_batch_name) for video_file in video_files]
     
     # 多进程处理（所有模式都使用多进程）
     print(f"🚀 启动多进程处理模式（{max_workers} 个进程）\n")
