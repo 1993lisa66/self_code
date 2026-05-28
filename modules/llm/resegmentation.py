@@ -3,7 +3,6 @@ import json
 import re
 from loguru import logger
 from openai import OpenAI
-from modules.utils.rate_limiter import wait_for_llm_api
 
 def semantic_resegment(fused_results, config=None, prompt_template=None):
     """
@@ -60,9 +59,6 @@ def semantic_resegment(fused_results, config=None, prompt_template=None):
 {combined_text}
 """
         try:
-            # API 速率限制检查
-            wait_for_llm_api()
-            
             response = client.chat.completions.create(
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],

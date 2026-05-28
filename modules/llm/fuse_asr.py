@@ -3,7 +3,6 @@ import json
 import asyncio
 from loguru import logger
 from openai import OpenAI
-from modules.utils.rate_limiter import wait_for_llm_api
 
 def fuse_asr_result(multi_asr_results, config=None, prompt_template=None):
     """
@@ -96,9 +95,6 @@ def fuse_asr_result(multi_asr_results, config=None, prompt_template=None):
 """
 
             try:
-                # API 速率限制检查
-                wait_for_llm_api()
-                
                 response = client.chat.completions.create(
                     model=model_name,
                     messages=[{"role": "user", "content": prompt}],

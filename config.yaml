@@ -6,21 +6,15 @@ paths:
   output_dir: outputs
   cache_dir: cache
   log_dir: logs
-  prompts_dir: prompts
+  prompts_dir: config/prompts  # 提示词目录（优化后的路径）
   assets_dir: assets
   models_dir: models  # 本地模型存储目录
+  batches_dir: config/batches  # 批次配置目录
+  terminology_file: config/terminology.json  # 全局术语表
 
 global:
   max_concurrency:
-    asr_selector: 15
-    english_translator: 15
-    tts_text_processor: 20
-    chapter_generator: 1
-  video_processing:
-    max_parallel_videos: 8  # 同时处理的视频数量 (1-5)
-    api_rate_limits:
-      llm_per_minute: 15  # LLM API 每分钟最大调用次数
-      tts_per_minute: 30  # TTS API 每分钟最大调用次数
+    video_processor: 5  # 视频处理器的并行进程数（1=单进程，>1=多进程）
   auto_cleanup_cache: true  # 处理完每个视频后自动清理缓存
 
 audio:
@@ -39,7 +33,7 @@ asr:
   voting_models:
     - whisperx
     - glm
-  terminology_file: terminology.json
+  terminology_file: config/terminology.json  # 全局术语表（使用新路径）
 
 whisperx:
   model: base

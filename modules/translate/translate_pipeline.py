@@ -2,7 +2,6 @@ import os
 import json
 from loguru import logger
 from openai import OpenAI
-from modules.utils.rate_limiter import wait_for_llm_api
 
 def translate_segments(fused_results, target_lang="zh", config=None, prompt_template=None):
     """
@@ -106,9 +105,6 @@ def translate_segments(fused_results, target_lang="zh", config=None, prompt_temp
 """
         
         try:
-            # API 速率限制检查
-            wait_for_llm_api()
-            
             response = client.chat.completions.create(
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
