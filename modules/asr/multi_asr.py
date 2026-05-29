@@ -127,9 +127,11 @@ class ASRModelLoader:
 
 def run_multi_asr(audio_path, segments, output_dir="cache/asr", device="cuda", model_size="large-v3"):
     """
-    多 ASR 识别模块。使用 2 模型架构：
-    1. WhisperX (Ground Truth 时间轴)
-    2. GLM/SenseVoice (FunASR)
+    多 ASR 识别模块。使用 4 模型架构：
+    1. WhisperX / Faster-Whisper (Ground Truth 时间轴)
+    2. GLM / SenseVoice (FunASR)
+    3. Parakeet-TDT 1.1B (NeMo) — 新增
+    4. Canary-1B (NeMo) — 新增
     """
     # 确保路径是绝对路径
     audio_path = os.path.abspath(audio_path)
@@ -144,10 +146,15 @@ def run_multi_asr(audio_path, segments, output_dir="cache/asr", device="cuda", m
     if os.path.exists(output_path):
         logger.info(f"使用 Multi-ASR 缓存: {output_path}")
         with open(output_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            cached = json.load(f)
+        # 兼容旧缓存：缺少 parakeet/canary 时降级重跑
+        if "parakeet" not in cached or "canary" not in cached:
+            logger.info("检测到旧版缓存（缺少 parakeet/canary），将重新识别...")
+        else:
+            return cached
 
     loader = ASRModelLoader()
-    multi_results = {"whisperx": [], "glm": []}
+    multi_results = {"whisperx": [], "glm": [], "parakeet": [], "canary": []}
 
     try:
         # --- 1. WhisperX (Faster-Whisper) ---
@@ -221,16 +228,109 @@ def run_multi_asr(audio_path, segments, output_dir="cache/asr", device="cuda", m
                 import traceback
                 logger.debug(traceback.format_exc())
 
-        # 补全逻辑：如果 FunASR 失败，用 WhisperX 结果填充
-        if not multi_results["glm"]:
-            logger.info("模型 glm 结果为空，使用 WhisperX 占位")
-            multi_results["glm"] = [{"text": s["text"]} for s in whisper_segs]
-        elif len(multi_results["glm"]) < len(whisper_segs):
-            # 如果长度不足，补齐
-            logger.info("模型 glm 结果长度不足，正在补齐...")
-            while len(multi_results["glm"]) < len(whisper_segs):
-                idx = len(multi_results["glm"])
-                multi_results["glm"].append({"text": whisper_segs[idx]["text"]})
+        # --- 4. NeMo Parakeet + Canary (1.1B 参数级模型) ---
+        nemo_models = loader.get_nemo_models(device)
+        if nemo_models:
+            import tempfile
+            import wave
+            
+            # 将切片保存为临时 WAV 文件供 NeMo 调用
+            chunk_temp_dir = os.path.join(output_dir, "chunks_nemo")
+            os.makedirs(chunk_temp_dir, exist_ok=True)
+            chunk_paths = []
+            try:
+                for idx, chunk_data in enumerate(audio_chunks):
+                    chunk_path = os.path.join(chunk_temp_dir, f"chunk_{idx}.wav")
+                    with wave.open(chunk_path, 'wb') as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)  # 16-bit
+                        wf.setframerate(sr)
+                        wf.writeframes((chunk_data * 32767).astype(np.int16).tobytes())
+                    chunk_paths.append(chunk_path)
+                
+                # 按批次处理，避免内存溢出
+                n_batch_size = 10
+                
+                # 4a. Parakeet
+                logger.info("开始 NeMo Parakeet 批量识别...")
+                try:
+                    total_p = 0
+                    for i in range(0, len(chunk_paths), n_batch_size):
+                        batch_paths = chunk_paths[i:i+n_batch_size]
+                        res = nemo_models["parakeet"].transcribe(
+                            paths2audio_files=batch_paths,
+                            batch_size=min(n_batch_size, len(batch_paths)),
+                            num_workers=0
+                        )
+                        for r in res:
+                            multi_results["parakeet"].append({"text": r.strip() if isinstance(r, str) else str(r).strip()})
+                        total_p += len(batch_paths)
+                    logger.success(f"Parakeet 识别完成，共 {len(multi_results['parakeet'])} 个片段")
+                except Exception as e:
+                    logger.error(f"Parakeet 识别失败: {e}")
+                    # 尝试逐条识别的备用方案
+                    logger.info("Parakeet 回退到逐条识别...")
+                    try:
+                        for chunk_path in chunk_paths:
+                            try:
+                                res = nemo_models["parakeet"].transcribe(paths2audio_files=[chunk_path], batch_size=1, num_workers=0)
+                                multi_results["parakeet"].append({"text": res[0].strip() if res else ""})
+                            except Exception:
+                                multi_results["parakeet"].append({"text": ""})
+                        logger.success(f"Parakeet 逐条识别完成: {len(multi_results['parakeet'])}")
+                    except Exception as e2:
+                        logger.error(f"Parakeet 回退方案也失败: {e2}")
+                
+                # 4b. Canary
+                logger.info("开始 NeMo Canary 批量识别...")
+                try:
+                    total_c = 0
+                    for i in range(0, len(chunk_paths), n_batch_size):
+                        batch_paths = chunk_paths[i:i+n_batch_size]
+                        res = nemo_models["canary"].transcribe(
+                            paths2audio_files=batch_paths,
+                            batch_size=min(n_batch_size, len(batch_paths)),
+                            num_workers=0
+                        )
+                        for r in res:
+                            multi_results["canary"].append({"text": r.strip() if isinstance(r, str) else str(r).strip()})
+                        total_c += len(batch_paths)
+                    logger.success(f"Canary 识别完成，共 {len(multi_results['canary'])} 个片段")
+                except Exception as e:
+                    logger.error(f"Canary 识别失败: {e}")
+                    logger.info("Canary 回退到逐条识别...")
+                    try:
+                        for chunk_path in chunk_paths:
+                            try:
+                                res = nemo_models["canary"].transcribe(paths2audio_files=[chunk_path], batch_size=1, num_workers=0)
+                                multi_results["canary"].append({"text": res[0].strip() if res else ""})
+                            except Exception:
+                                multi_results["canary"].append({"text": ""})
+                        logger.success(f"Canary 逐条识别完成: {len(multi_results['canary'])}")
+                    except Exception as e2:
+                        logger.error(f"Canary 回退方案也失败: {e2}")
+                
+            finally:
+                # 清理临时 WAV 文件
+                if os.path.exists(chunk_temp_dir):
+                    import shutil
+                    shutil.rmtree(chunk_temp_dir, ignore_errors=True)
+        else:
+            logger.warning("NeMo 模型加载失败，跳过 Parakeet/Canary 识别")
+
+        # 补全逻辑：如果某模型失败，用 WhisperX 结果填充
+        def _fill_if_needed(model_key):
+            if not multi_results[model_key]:
+                logger.info(f"模型 {model_key} 结果为空，使用 WhisperX 占位")
+                multi_results[model_key] = [{"text": s["text"]} for s in whisper_segs]
+            elif len(multi_results[model_key]) < len(whisper_segs):
+                logger.info(f"模型 {model_key} 结果长度不足，正在补齐...")
+                while len(multi_results[model_key]) < len(whisper_segs):
+                    idx = len(multi_results[model_key])
+                    multi_results[model_key].append({"text": whisper_segs[idx]["text"]})
+
+        for key in ["glm", "parakeet", "canary"]:
+            _fill_if_needed(key)
 
         # 保存结果
         with open(output_path, 'w', encoding='utf-8') as f:
