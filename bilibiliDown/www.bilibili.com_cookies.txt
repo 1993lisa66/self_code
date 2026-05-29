@@ -1,0 +1,43 @@
+# Netscape HTTP Cookie File
+# Filtered: only .bilibili.com / .bilibili.cn cookies retained
+# This file is auto-generated. Do not edit.
+
+.bilibili.cn	TRUE	/	TRUE	13436935285223108	DedeUserID	3546722693285891
+.bilibili.cn	TRUE	/	TRUE	13436935285223126	DedeUserID__ckMd5	67ed6c30898abcc1
+.bilibili.com	TRUE	/	FALSE	13456044256000000	CURRENT_FNVAL	2000
+.bilibili.com	TRUE	/	FALSE	13455000087000000	CURRENT_QUALITY	80
+.bilibili.com	TRUE	/	FALSE	13436974303938022	DedeUserID	3546722693285891
+.bilibili.com	TRUE	/	FALSE	13436974303938066	DedeUserID__ckMd5	67ed6c30898abcc1
+.bilibili.com	TRUE	/	FALSE	13450276990053592	LIVE_BUVID	AUTO3217712433901480
+.bilibili.com	TRUE	/	FALSE	13456157239262196	PVID	1
+.bilibili.com	TRUE	/	TRUE	13436974303937900	SESSDATA	93ca207e%2C1792500704%2Cd192c%2A42CjBnobqgwGxKGchSi7K1PxOfqEyhneYGDP5V-_NmI8oSFHoaRSZtYLG6W1b02gzRsbASVjVYLUFaOUtBWHpYQXdsSWhtV25Ua3IwalREQkR2Z1ZCMUkzNXZqNEtCb09XVmc5TEM3ZmNETGhDbG5wSkczdGV5T09EQ2RVVnBZQmFmYTg5Vmx0RnNRIIEC
+.bilibili.com	TRUE	/	FALSE	13444999141000000	_uuid	66CEF10A5-6C1E-D1010A-227B-C1C8D577101B541367infoc
+.bilibili.com	TRUE	/	FALSE	0	b_lsid	2FE14EED_19E7244DE73
+.bilibili.com	TRUE	/	FALSE	13444999141225552	b_nut	1768989541
+.bilibili.com	TRUE	/	FALSE	13436974303937992	bili_jct	8cf8865c92160eb72527dd64574a098f
+.bilibili.com	TRUE	/	FALSE	13424678915000000	bili_ticket	eyJhbGciOiJIUzI1NiIsImtpZCI6InMwMyIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3ODAyMDUzMTUsImlhdCI6MTc3OTk0NjA1NSwicGx0IjotMX0.UEXeickWVlECGZ-NBcdv_clnwdqQwBwTqw9jkrUrptg
+.bilibili.com	TRUE	/	FALSE	13424678915000000	bili_ticket_expires	1780205255
+.bilibili.com	TRUE	/	FALSE	13427036805000000	bp_t_offset_3546722693285891	1207456203307745280
+.bilibili.com	TRUE	/	FALSE	13455970466000000	browser_resolution	2560-1209
+.bilibili.com	TRUE	/	FALSE	0	bsource	search_google
+.bilibili.com	TRUE	/	FALSE	13448023141225408	buvid3	38D07CA3-FC8E-2CEA-AB9B-EFA513F0001D41183infoc
+.bilibili.com	TRUE	/	FALSE	13459065534340132	buvid4	46646703-ADFB-6D93-D700-6F9DE107F95541715-026012117-6L4Xva80GtAkpLFoyGaZGQ%3D%3D
+.bilibili.com	TRUE	/	FALSE	13448023141470324	buvid_fp	df2e15f940dfbf6bb3ff304bc0e4e5be
+.bilibili.com	TRUE	/	FALSE	13448598128000000	hit-dyn-v2	1
+.bilibili.com	TRUE	/	FALSE	13455970466000000	home_feed_column	5
+.bilibili.com	TRUE	/	FALSE	13424767022000000	ogv_device_support_dolby	0
+.bilibili.com	TRUE	/	FALSE	13424767022000000	ogv_device_support_hdr	1
+.bilibili.com	TRUE	/	FALSE	13448023142048544	rpdid	|(J~J|RRlulY0J'u~Y)m)mlRk
+.bilibili.com	TRUE	/	FALSE	0	sid	8adr7heo
+.bilibili.com	TRUE	/	FALSE	13445235284000000	theme-avatar-tip-show	SHOWED
+.bilibili.com	TRUE	/	FALSE	13456042875000000	theme-tip-show	SHOWED
+search.bilibili.com	FALSE	/	FALSE	0	bmg_af_switch	1
+search.bilibili.com	FALSE	/	FALSE	0	bmg_src_def_domain	i0.hdslb.com
+space.bilibili.com	FALSE	/	FALSE	0	bmg_af_sc	{"none":{"on":1,"def":"i0.hdslb.com"},"sgp":{"on":1,"def":"i0-sgp.hdslb.com"}}
+space.bilibili.com	FALSE	/	FALSE	0	bmg_af_switch	1
+space.bilibili.com	FALSE	/	FALSE	0	bmg_src_def_domain	i0.hdslb.com
+t.bilibili.com	FALSE	/	FALSE	0	bmg_af_switch	1
+t.bilibili.com	FALSE	/	FALSE	0	bmg_src_def_domain	i0.hdslb.com
+www.bilibili.com	FALSE	/	FALSE	0	bmg_af_sc	{"none":{"on":1,"def":"i0.hdslb.com"},"sgp":{"on":1,"def":"i0-sgp.hdslb.com"}}
+www.bilibili.com	FALSE	/	FALSE	0	bmg_af_switch	1
+www.bilibili.com	FALSE	/	FALSE	0	bmg_src_def_domain	i0.hdslb.com
