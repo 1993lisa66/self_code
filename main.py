@@ -241,7 +241,7 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
         
         logger.success(f"ASR 识别完成，共 {len(whisperx_segments)} 个片段")
         
-        # STEP 4: LLM 修正（可选，用于提高字幕质量）
+        # STEP 4: LLM 修正
         fused_results = whisperx_segments
         if config.get('llm', {}).get('api_key'):
             logger.info("\n[STEP 4/6] LLM 修正字幕文本...")
