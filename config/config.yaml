@@ -1,0 +1,75 @@
+asr:
+  device: cpu
+  model_id: iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch
+  model_size: base
+  terminology_file: config/terminology.json
+  voting_models:
+  - whisperx
+  - glm
+audio:
+  channels: 1
+  normalize: true
+  sample_rate: 16000
+global:
+  auto_cleanup_cache: true
+  max_concurrency:
+    video_processor: 1
+llm:
+  api_base: https://api.siliconflow.cn/v1
+  api_key: sk-zwgrgjgcrqkbtnyghgzebsbeybhnoeozjydrnkzrysghqoxj
+  chapter_generator:
+    model: deepseek-ai/DeepSeek-V3
+    temperature: 0.1
+  model: deepseek-ai/DeepSeek-V3
+  prompts:
+    asr_fix: asr_fix.txt
+    chapters: chapters.txt
+    resegmentation: resegmentation.txt
+    semantic_segmentation: semantic_segmentation.txt
+    translation: translation.txt
+    tts_prep: tts_prep.txt
+  translator:
+    max_retries: 3
+    model: deepseek-ai/DeepSeek-V3
+    temperature: 0.1
+  tts_processor:
+    model: deepseek-ai/DeepSeek-V3
+    temperature: 0.1
+paths:
+  assets_dir: assets
+  batches_dir: config/batches
+  cache_dir: cache
+  input_dir: input
+  log_dir: logs
+  models_dir: models
+  output_dir: outputs
+  prompts_dir: config/prompts
+  terminology_file: config/terminology.json
+project:
+  name: TransVoice
+translate:
+  target_language: zh
+tts:
+  provider: edge
+  speed_limit: 1.5
+  voice: zh-CN-XiaoxiaoNeural
+vad:
+  min_silence_duration_ms: 300
+  min_speech_duration_ms: 250
+video:
+  audio_mode: tts_only
+  burn_subtitles: false
+  codec: libx264
+  crf: 23
+  preset: fast
+  subtitle_font_size: 18
+  subtitle_position: bottom
+whisperx:
+  align: true
+  batch_size: 16
+  compute_type: float16
+  device: cpu
+  diarization: true
+  max_speakers: 10
+  min_speakers: 1
+  model: base

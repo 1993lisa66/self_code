@@ -6,3 +6,9 @@
 /input/
 /outputs/
 /cache/
+
+# pipenv
+/.venv/
+Pipfile.lock
+/models/
+/ex/

@@ -1,0 +1,50 @@
+# ═══════════════════════════════════════════════
+# BilibiliDown 配置文件（项目根目录）
+# ═══════════════════════════════════════════════
+
+# ── 下载默认值 ──
+default:
+  url: ""
+  output_dir: ""
+  quality: "bestvideo+bestaudio"
+
+# ── Cookie 文件 ──
+cookie:
+  file: "www.bilibili.com_cookies.txt"
+
+# ── 网络设置 ──
+network:
+  retries: 10
+  fragment_retries: 10
+  socket_timeout: 30
+  sleep_interval_requests: 1
+  sleep_interval: 1
+  max_sleep_interval_requests: 3
+  concurrent_fragment_downloads: 5
+
+# ── 合集下载 ──
+collection:
+  min_delay: 2.0
+  max_delay: 5.0
+  max_retries: 3
+  retry_delays: [3, 8, 15]
+
+# ── 字幕 ──
+subtitle:
+  download: true
+  embed: false
+  format: "srt"
+  languages: ["all"]
+
+# ── 用户代理 ──
+user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+# ── 路径（相对于项目根目录）──
+paths:
+  ffmpeg_dir: "ffmpeg/bin"
+  log_dir: "logs"
+  output_dir: "outputs/bilibili"
+
+# ── GUI 界面设置 ──
+gui:
+  theme: "darkly"

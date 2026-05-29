@@ -9,12 +9,10 @@ logger = logging.getLogger(__name__)
 
 
 def cookie_file_exists() -> bool:
-    """检查 Cookie 文件是否存在"""
     return COOKIE_FILE.exists() and COOKIE_FILE.stat().st_size > 100
 
 
 def cookie_has_sessdata() -> bool:
-    """检查 Cookie 文件是否包含 SESSDATA"""
     if not cookie_file_exists():
         return False
     content = COOKIE_FILE.read_text(encoding="utf-8")
@@ -22,7 +20,6 @@ def cookie_has_sessdata() -> bool:
 
 
 def generate_cookie_instructions():
-    """打印获取 Cookie 文件的指引（手动导出方式）"""
     print("""
 ╔══════════════════════════════════════════════════════════════╗
 ║              B站 Cookie 获取指引                             ║
@@ -35,8 +32,8 @@ def generate_cookie_instructions():
 ║    2. 在浏览器中登录 bilibili.com                            ║
 ║    3. 打开任意 B站 页面，点击该扩展图标                      ║
 ║    4. 点击 "Export" 导出 cookies.txt                         ║
-║    5. 将导出的文件放到:                                      ║
-║       bilibiliDown/www.bilibili.com_cookies.txt              ║
+║    5. 将导出的文件放到项目根目录:                             ║
+║       www.bilibili.com_cookies.txt                           ║
 ║                                                              ║
 ║  方法二：浏览器开发者工具手动复制                            ║
 ║    1. 在浏览器中登录 bilibili.com                            ║
@@ -54,7 +51,7 @@ def generate_cookie_instructions():
 ║    DedeUserID — 用户 ID（可选，用于验证）                    ║
 ║                                                              ║
 ║  Cookie 文件位置:                                            ║
-║    bilibiliDown/www.bilibili.com_cookies.txt                 ║
+║    www.bilibili.com_cookies.txt（项目根目录）                 ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 """)

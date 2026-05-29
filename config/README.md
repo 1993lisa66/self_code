@@ -54,9 +54,9 @@ manager.create_batch_prompts(
 **使用批次处理视频**:
 ```bash
 # 命令行方式
-python main.py /path/to/videos --batch ICT_Trading_Batch1
+python video_cli.py /path/to/videos --batch ICT_Trading_Batch1
 
-# 或在 main.py 中配置
+# 或在 video_cli.py 中配置
 BATCH_NAME = "ICT_Trading_Batch1"
 ```
 

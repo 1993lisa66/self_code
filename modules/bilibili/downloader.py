@@ -6,7 +6,9 @@ import re
 import time
 import random
 import logging
+import threading
 from pathlib import Path
+from typing import Optional, Callable
 
 from .config import (
     FFMPEG_BIN, COOKIE_FILE, get_output_dir, set_output_dir as _set_output_dir,
@@ -25,7 +27,11 @@ class BilibiliDownloader:
     基于 yt-dlp 实现，支持音视频分离流的自动下载与 FFmpeg 合并。
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        progress_callback: Optional[Callable] = None,
+        log_callback: Optional[Callable] = None,
+    ):
         try:
             import yt_dlp
             self.yt_dlp = yt_dlp
@@ -36,6 +42,41 @@ class BilibiliDownloader:
         if not check_ffmpeg():
             logger.error("FFmpeg 不可用，无法合并音视频轨道")
             sys.exit(1)
+
+        # GUI 回调（线程安全）
+        self._progress_cb = progress_callback
+        self._log_cb = log_callback
+        self._cb_lock = threading.Lock()
+
+    def set_callbacks(
+        self,
+        progress_callback: Optional[Callable] = None,
+        log_callback: Optional[Callable] = None,
+    ):
+        """设置进度和日志回调（GUI 模式下使用）"""
+        with self._cb_lock:
+            self._progress_cb = progress_callback
+            self._log_cb = log_callback
+
+    def _emit_progress(self, data: dict):
+        """线程安全地发送进度回调"""
+        with self._cb_lock:
+            cb = self._progress_cb
+        if cb:
+            try:
+                cb(data)
+            except Exception:
+                pass
+
+    def _emit_log(self, level: str, message: str):
+        """线程安全地发送日志回调"""
+        with self._cb_lock:
+            cb = self._log_cb
+        if cb:
+            try:
+                cb(level, message)
+            except Exception:
+                pass
 
     # ── 构建 yt-dlp 选项 ─────────────────────
     def _build_opts(
@@ -112,13 +153,36 @@ class BilibiliDownloader:
             else:
                 progress = f"{format_size(downloaded)} 已下载"
 
+            # 终端输出
             print(
                 f"\r  📥 {filename[:50]:<50} {progress} 速度:{speed_str} ETA:{eta}s",
                 end="",
             )
+
+            # GUI 回调
+            pct = float(percent.strip("%")) if percent.strip("%").replace(".", "").isdigit() else 0
+            self._emit_progress({
+                "status": "downloading",
+                "filename": filename,
+                "percent": pct,
+                "downloaded": downloaded,
+                "total": total if total else 0,
+                "speed": speed,
+                "speed_str": speed_str,
+                "eta": eta,
+                "progress_str": progress,
+            })
+
         elif status == "finished":
             print()
-            logger.info(f"✅ 下载完成: {os.path.basename(d.get('filename', ''))}")
+            filename = os.path.basename(d.get("filename", ""))
+            logger.info(f"✅ 下载完成: {filename}")
+
+            self._emit_progress({
+                "status": "finished",
+                "filename": filename,
+                "total": d.get("total_bytes", 0),
+            })
 
     # ── 获取视频信息 ─────────────────────────
     def get_video_info(self, url: str, verbose: bool = False) -> dict:
@@ -162,9 +226,10 @@ class BilibiliDownloader:
             return False
 
         format_map = {
+            "best": "bestvideo+bestaudio",
             "bestvideo+bestaudio": "bestvideo+bestaudio",
-            "1080": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-            "720": "bestvideo[height<=720]+bestaudio/best[height<=720]",
+            "1080": "bestvideo[height<=1080]+bestaudio",
+            "720": "bestvideo[height<=720]+bestaudio",
         }
         fmt = format_map.get(quality, quality)
 

@@ -46,9 +46,18 @@ def fuse_asr_result(multi_asr_results, config=None, prompt_template=None):
     logger.info(f"总共 {len(whisper_segs)} 个片段，分 {total_batches} 批处理（每批 {batch_size} 个）")
     
     try:
+        llm_disabled = False  # 一旦遇到余额不足等致命错误，跳过后续所有批次
         for i in range(0, len(whisper_segs), batch_size):
             batch_num = i // batch_size + 1
             batch = whisper_segs[i:i+batch_size]
+
+            if llm_disabled:
+                logger.info(f"跳过批次 {batch_num}/{total_batches}（LLM 已禁用，直接使用原文）")
+                for j, seg in enumerate(batch):
+                    global_idx = i + j
+                    final_results[global_idx] = {"start": seg["start"], "end": seg["end"], "text": seg["text"]}
+                continue
+
             logger.info(f"正在融合 ASR 片段批次: {batch_num}/{total_batches} (片段 {i+1}-{min(i+len(batch), len(whisper_segs))})...")
             
             combined_context = ""
@@ -141,14 +150,18 @@ def fuse_asr_result(multi_asr_results, config=None, prompt_template=None):
                 progress_pct = (completed_batches / total_batches * 100) if total_batches > 0 else 0
                 logger.info(f"批次 {batch_num}/{total_batches} 融合完成 ({progress_pct:.1f}%)")
             except Exception as e:
+                err_msg = str(e)
                 logger.error(f"批次融合失败 (批次 {batch_num}/{total_batches}): {e}")
+                # 检测致命错误（余额不足、key 无效等），禁用后续 LLM 调用
+                if any(kw in err_msg.lower() for kw in ('balance', 'insufficient', 'invalid', 'unauthorized', '403', '401')):
+                    llm_disabled = True
+                    logger.warning(f"检测到致命 API 错误，将跳过后续所有批次的 LLM 融合，直接使用原文")
                 for j, seg in enumerate(batch):
                     global_idx = i + j
                     final_results[global_idx] = {"start": seg["start"], "end": seg["end"], "text": seg["text"]}
-                # 即使失败也要更新进度
                 completed_batches += 1
                 progress_pct = (completed_batches / total_batches * 100) if total_batches > 0 else 0
-                logger.warning(f"批次 {batch_num}/{total_batches} 失败，使用原文 ({progress_pct:.1f}%)")
+                logger.info(f"批次 {batch_num}/{total_batches} 使用原文 ({progress_pct:.1f}%)")
 
         logger.success(f"多模型融合修正完成，共 {len(final_results)} 段。")
         return final_results

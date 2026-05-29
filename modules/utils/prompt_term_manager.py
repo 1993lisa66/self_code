@@ -16,14 +16,19 @@ from openai import OpenAI
 class PromptTermManager:
     """提示词和术语管理器"""
     
-    def __init__(self, config_path="config.yaml"):
+    def __init__(self, config_path=None):
         """
         初始化管理器
         
         Args:
-            config_path: 配置文件路径
+            config_path: 配置文件路径（相对于项目根目录）
         """
-        self.project_root = os.path.dirname(os.path.abspath(__file__))
+        # ── 项目根目录（modules/utils/prompt_term_manager.py → 上级3层）──
+        self.project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        
+        if config_path is None:
+            config_path = os.path.join("config", "config.yaml")
+        
         self.config = self._load_config(config_path)
         
         # 初始化 LLM 客户端
@@ -180,6 +185,11 @@ class PromptTermManager:
                 return {}
                 
         except Exception as e:
+            err_msg = str(e)
+            # 检测致命 API 错误，禁用 LLM 功能
+            if any(kw in err_msg.lower() for kw in ('balance', 'insufficient', 'invalid', 'unauthorized', '403', '401')):
+                self.llm_available = False
+                logger.warning("检测到致命 API 错误（余额不足/Key无效），已禁用后续 LLM 调用")
             logger.error(f"术语提取失败: {e}")
             return {}
     

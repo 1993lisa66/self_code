@@ -127,21 +127,10 @@ def run_ffmpeg_command(cmd: list, description: str = "FFmpeg 命令",
     # 为多进程环境准备环境变量
     env = os.environ.copy()
     
-    # 确保 FFmpeg 的动态库路径被正确设置（macOS 特别需要）
+    # 确保 FFmpeg bin 目录在 PATH 中（程序使用包装脚本，已内置 DYLD 处理）
     ffmpeg_dir = os.path.dirname(cmd[0]) if cmd else ""
     if ffmpeg_dir and os.path.exists(ffmpeg_dir):
-        # 添加 FFmpeg bin 目录到 PATH
         env["PATH"] = ffmpeg_dir + os.pathsep + env.get("PATH", "")
-        
-        # macOS: 设置动态库路径
-        if os.name != 'nt':  # 非 Windows
-            lib_dir = os.path.join(os.path.dirname(ffmpeg_dir), "lib")
-            if os.path.exists(lib_dir):
-                env["DYLD_LIBRARY_PATH"] = lib_dir + os.pathsep + env.get("DYLD_LIBRARY_PATH", "")
-            # 也尝试 homebrew 的路径
-            brew_lib = "/opt/homebrew/Cellar/ffmpeg/8.1.1/lib"
-            if os.path.exists(brew_lib):
-                env["DYLD_LIBRARY_PATH"] = brew_lib + os.pathsep + env.get("DYLD_LIBRARY_PATH", "")
     
     result = subprocess.run(
         cmd,
@@ -155,7 +144,8 @@ def run_ffmpeg_command(cmd: list, description: str = "FFmpeg 命令",
         error_msg = f"{description} 失败 (返回码: {result.returncode})"
         if capture_output and result.stderr:
             stderr_text = result.stderr.decode('utf-8', errors='replace') if isinstance(result.stderr, bytes) else result.stderr
-            error_msg += f"\n错误信息: {stderr_text[:500]}"
+            # 输出末尾部分（跳过 FFmpeg 版本横幅，定位真正的错误）
+            error_msg += f"\n错误信息（末尾 2000 字）:\n{stderr_text[-2000:]}"
         
         logger.error(error_msg)
         

@@ -1,0 +1,46 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+# ── 核心依赖 ──
+pydub = "*"
+srt = "*"
+
+# ── ML / AI 框架 ──
+torch = "*"
+torchaudio = "*"
+numpy = "*"
+librosa = "*"
+nltk = "*"
+omegaconf = "*"
+
+# ── ASR 语音识别 ──
+faster-whisper = "*"
+funasr = "*"
+
+# ── TTS 语音合成 ──
+edge-tts = "*"
+aiofiles = "*"
+
+# ── LLM API ──
+openai = "*"
+
+# ── 可选：备用 FFmpeg 探测 ──
+imageio-ffmpeg = "*"
+
+# ── 可选：NVIDIA NeMo ASR（体积庞大，按需安装）──
+# nemo_toolkit = {version = "*", extras = ["all"]}
+flask = "*"
+loguru = "*"
+pyyaml = "*"
+yt-dlp = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.10"
+
+[pipenv]
+allow_prereleases = false

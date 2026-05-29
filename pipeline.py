@@ -80,7 +80,7 @@ def split_into_subtitles(translated_results):
     return final_subtitles
 
 class VideoTranslationPipeline:
-    def __init__(self, config_path="config.yaml", config_dict=None):
+    def __init__(self, config_path="config/config.yaml", config_dict=None):
         """
         初始化 Pipeline
         
@@ -101,7 +101,11 @@ class VideoTranslationPipeline:
         log_dir = self.config['paths']['log_dir']
         if not os.path.exists(log_dir):
             os.makedirs(log_dir)
-        logger.add(os.path.join(log_dir, "runtime.log"), rotation="100 MB")
+        logger.add(
+            os.path.join(log_dir, "runtime_{time:YYYY-MM-DD}.log"),
+            rotation="00:00",
+            retention="7 days"
+        )
         
         # 预加载提示词内容
         self.prompts = self._load_prompts()
@@ -309,7 +313,6 @@ class VideoTranslationPipeline:
             final_video = merge_video(
                 video_path, 
                 tts_audio, 
-                srt_path, 
                 output_dir=target_output_dir,
                 config=self.config.get('video', {})
             )

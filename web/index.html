@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>哔哩哔哩下载 — 视频工具平台</title>
+<link rel="stylesheet" href="https://unpkg.com/element-plus/dist/index.css">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app" v-cloak>
+  <el-container>
+    <!-- ===== 顶部栏 ===== -->
+    <el-header height="56px" class="app-header">
+      <div class="header-left">
+        <span class="logo">🎬 视频工具平台</span>
+        <el-button size="small" text style="margin-left:16px;color:#6e7681" @click="goProcess">🔧 视频处理</el-button>
+      </div>
+      <div class="header-right">
+        <el-tag v-if="cookieOk" type="success" size="default" effect="dark">🍪 已登录</el-tag>
+        <el-upload v-else ref="cookieUpload" action="/api/cookie/upload"
+          :auto-upload="true" :show-file-list="false" accept=".txt"
+          :on-success="onCookieUploaded" :on-error="onCookieError"
+          :before-upload="beforeCookieUpload">
+          <el-button size="small" type="warning" plain>导入 cookies.txt</el-button>
+        </el-upload>
+      </div>
+    </el-header>
+
+    <el-main>
+      <div class="content-row">
+        <el-row :gutter="16">
+          <el-col :span="8">
+            <el-card shadow="always" class="panel-card">
+              <template #header><span>📎 视频链接</span></template>
+              <el-input v-model="form.url" placeholder="粘贴 B站视频链接 或 BV号..." size="default">
+                <template #append><el-button @click="pasteUrl">粘贴</el-button></template>
+              </el-input>
+            </el-card>
+            <el-card shadow="always" class="panel-card">
+              <template #header><span>📁 输出目录</span></template>
+              <el-input v-model="form.outDir" placeholder="点击右侧按钮选择目录..." size="default" clearable>
+                <template #append><el-button @click="dirPicker.show=true">选择目录</el-button></template>
+              </el-input>
+            </el-card>
+            <el-card shadow="always" class="panel-card">
+              <template #header><span>🎨 下载选项</span></template>
+              <div class="form-item">
+                <label>模式</label>
+                <el-radio-group v-model="form.mode" size="default" style="width:100%">
+                  <el-radio-button label="auto">自动检测</el-radio-button>
+                  <el-radio-button label="single">单视频</el-radio-button>
+                  <el-radio-button label="playlist">合集/列表</el-radio-button>
+                </el-radio-group>
+              </div>
+              <div class="form-item">
+                <label>画质</label>
+                <el-radio-group v-model="form.quality" size="default" style="width:100%">
+                  <el-radio-button label="best">最高画质</el-radio-button>
+                  <el-radio-button label="1080">1080P</el-radio-button>
+                  <el-radio-button label="720">720P</el-radio-button>
+                </el-radio-group>
+              </div>
+              <div class="form-item">
+                <label>字幕下载</label>
+                <el-radio-group v-model="form.downloadSubs" size="default" style="width:100%">
+                  <el-radio-button :label="true">下载字幕</el-radio-button>
+                  <el-radio-button :label="false">不下载</el-radio-button>
+                </el-radio-group>
+              </div>
+              <div class="form-item">
+                <label>嵌入视频</label>
+                <el-radio-group v-model="form.embedSubs" size="default" style="width:100%">
+                  <el-radio-button :label="true">嵌入字幕</el-radio-button>
+                  <el-radio-button :label="false">不嵌入</el-radio-button>
+                </el-radio-group>
+              </div>
+              <el-row :gutter="10" style="margin-top:16px">
+                <el-col :span="12">
+                  <el-button type="success" @click="startDownload"
+                    :loading="running" :disabled="running" style="width:100%">
+                    开始下载
+                  </el-button>
+                </el-col>
+                <el-col :span="12">
+                  <el-button type="danger" @click="stopDownload"
+                    :disabled="!running" style="width:100%">停止</el-button>
+                </el-col>
+              </el-row>
+            </el-card>
+          </el-col>
+          <el-col :span="16">
+            <el-card shadow="always" class="panel-card">
+              <div class="status-bar">
+                <span class="status-dot" :class="{ running }"></span>
+                <span class="status-text">[[ statusText ]]</span>
+              </div>
+              <div class="progress-section" v-if="overallTotal > 0">
+                <div class="progress-label">[[ overallLabel ]]</div>
+                <el-progress :percentage="overallPercent"
+                  :color="overallPercent >= 100 ? '#67c23a' : '#409eff'"></el-progress>
+              </div>
+              <div class="file-info" v-if="currentFile">
+                <span class="file-name">📥 [[ currentFile ]]</span>
+                <span class="file-item">[[ currentSize ]]</span>
+                <span class="file-item">⚡ [[ currentSpeed ]]</span>
+                <span class="file-item" v-if="currentEta">⏱ [[ currentEta ]]</span>
+              </div>
+            </el-card>
+            <el-card shadow="always" class="panel-card log-card">
+              <template #header>
+                <span>📋 运行日志</span>
+                <el-button size="small" style="float:right" @click="logs = []">清空</el-button>
+              </template>
+              <div class="log-container" ref="logBox">
+                <div v-for="(line, idx) in logs" :key="idx" class="log-line"
+                  :class="'log-' + line.level.toLowerCase()">
+                  <span class="log-ts">[[ line.ts ]]</span>
+                  <span v-html="line.msg"></span>
+                </div>
+                <div v-if="logs.length === 0" class="log-line log-info">
+                  <span class="log-ts">--:--:--</span> 等待任务开始...
+                </div>
+              </div>
+            </el-card>
+          </el-col>
+        </el-row>
+      </div>
+    </el-main>
+  </el-container>
+
+  <!-- ===== 目录选择对话框 ===== -->
+  <el-dialog v-model="dirPicker.show" title="选择目录" width="560px" top="10vh">
+    <div class="dir-nav">
+      <el-button size="small" @click="dirPicker.goUp()" :disabled="dirPicker.stack.length <= 1">上级目录</el-button>
+      <span class="dir-path">[[ dirPicker.current ]]</span>
+    </div>
+    <div class="dir-list">
+      <div v-if="dirPicker.loading" style="text-align:center;padding:40px">加载中...</div>
+      <div v-else-if="dirPicker.items.length === 0" style="text-align:center;padding:40px;color:#6e7681">此目录下没有子文件夹</div>
+      <div v-for="d in dirPicker.items" :key="d" class="dir-item" @dblclick="dirPicker.goInto(d)">📁 [[ d ]]</div>
+    </div>
+    <template #footer>
+      <el-button @click="dirPicker.show = false">取消</el-button>
+      <el-button type="primary" @click="dirPicker.confirm()">选择此目录</el-button>
+    </template>
+  </el-dialog>
+</div>
+
+<script>
+  var DEFAULT_URL = {{ default_url | tojson }};
+  var DEFAULT_DIR = {{ default_dir | tojson }};
+  var COOKIE_OK = {{ cookie_ok | tojson }};
+</script>
+
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<script src="https://unpkg.com/element-plus"></script>
+<script src="https://unpkg.com/axios/dist/axios.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
