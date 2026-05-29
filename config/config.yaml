@@ -13,7 +13,7 @@ audio:
 global:
   auto_cleanup_cache: true
   max_concurrency:
-    video_processor: 1
+    video_processor: 3
 llm:
   api_base: https://api.siliconflow.cn/v1
   api_key: sk-zwgrgjgcrqkbtnyghgzebsbeybhnoeozjydrnkzrysghqoxj

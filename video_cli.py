@@ -858,7 +858,7 @@ if __name__ == "__main__":
     # 在这里定义输入输出路径和处理模式
     
     # 输入路径（可以是单个视频文件或包含视频的目录）
-    INPUT_PATH = "DeepCharts Course (Fabio & Andrea)- 2025"
+    INPUT_PATH = "/Volumes/mvp/交易场/DeepCharts Course (Fabio & Andrea)- 2025"
     
     # 输出目录
     OUTPUT_DIR = "/Volumes/mvp/交易场/DeepCharts Course (Fabio & Andrea)- 2025-中文"
