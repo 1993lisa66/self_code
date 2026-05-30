@@ -36,6 +36,7 @@ flask = "*"
 loguru = "*"
 pyyaml = "*"
 yt-dlp = "*"
+nemo-toolkit = {extras = ["all"], version = "*"}
 
 [dev-packages]
 

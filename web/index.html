@@ -46,14 +46,6 @@
             <el-card shadow="always" class="panel-card">
               <template #header><span>🎨 下载选项</span></template>
               <div class="form-item">
-                <label>模式</label>
-                <el-radio-group v-model="form.mode" size="default" style="width:100%">
-                  <el-radio-button label="auto">自动检测</el-radio-button>
-                  <el-radio-button label="single">单视频</el-radio-button>
-                  <el-radio-button label="playlist">合集/列表</el-radio-button>
-                </el-radio-group>
-              </div>
-              <div class="form-item">
                 <label>画质</label>
                 <el-radio-group v-model="form.quality" size="default" style="width:100%">
                   <el-radio-button label="best">最高画质</el-radio-button>
@@ -62,10 +54,11 @@
                 </el-radio-group>
               </div>
               <div class="form-item">
-                <label>字幕下载</label>
-                <el-radio-group v-model="form.downloadSubs" size="default" style="width:100%">
-                  <el-radio-button :label="true">下载字幕</el-radio-button>
-                  <el-radio-button :label="false">不下载</el-radio-button>
+                <label>下载内容</label>
+                <el-radio-group v-model="form.downloadMode" size="default" style="width:100%">
+                  <el-radio-button label="full">完整下载</el-radio-button>
+                  <el-radio-button label="subs_only">仅下载字幕</el-radio-button>
+                  <el-radio-button label="video_only">仅下载视频</el-radio-button>
                 </el-radio-group>
               </div>
               <div class="form-item">

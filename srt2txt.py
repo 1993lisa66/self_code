@@ -4,7 +4,7 @@
 import os
 import re
 
-FOLDER = "/Volumes/mvp/交易场/光子交易/合集·【光子交易】从0到考试资助账号 4.0（2025）"
+FOLDER = "/Volumes/mvp/交易场/价格行为/02.价格行为官方视频课"
 
 
 def read_file_auto(path: str) -> str:

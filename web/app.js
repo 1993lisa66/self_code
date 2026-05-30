@@ -7,8 +7,8 @@ const app = createApp({
     const form = reactive({
       url: DEFAULT_URL || '',
       outDir: DEFAULT_DIR || '',
-      mode: 'auto', quality: 'best',
-      downloadSubs: true, embedSubs: false,
+      quality: 'best',
+      downloadMode: 'full', embedSubs: false,
     });
     const running = ref(false);
     const statusText = ref('就绪，等待开始下载');
@@ -75,8 +75,8 @@ const app = createApp({
 
       try {
         const resp = await axios.post('/api/download', {
-          url: form.url, out_dir: form.outDir, mode: form.mode,
-          quality: form.quality, download_subs: form.downloadSubs,
+          url: form.url, out_dir: form.outDir,
+          quality: form.quality, download_mode: form.downloadMode,
           embed_subs: form.embedSubs,
         });
         if (resp.data.status !== 'started') {

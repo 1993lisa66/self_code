@@ -83,10 +83,19 @@ class BilibiliDownloader:
         self,
         is_playlist: bool = False,
         quality: str = "bestvideo+bestaudio",
-        download_subs: bool = True,
         embed_subs: bool = False,
+        skip_danmaku: bool = True,
         verbose: bool = False,
+        download_mode: str = "full",
     ) -> dict:
+        # 下载模式: full / subs_only / video_only
+        if download_mode == "subs_only":
+            download_subs, subs_only = True, True
+        elif download_mode == "video_only":
+            download_subs, subs_only = False, False
+        else:  # full
+            download_subs, subs_only = True, False
+
         _output_dir = get_output_dir()
         if is_playlist:
             output_template = str(
@@ -109,7 +118,7 @@ class BilibiliDownloader:
             "retries": _get("network.retries", 10),
             "fragment_retries": _get("network.fragment_retries", 10),
             "ignoreerrors": is_playlist,
-            "continuedl": True,
+            "continuedl": not subs_only,  # 仅字幕时跳过断点续传
             "concurrent_fragment_downloads": _get("network.concurrent_fragment_downloads", 5),
             "sleep_interval_requests": _get("network.sleep_interval_requests", 1),
             "sleep_interval": _get("network.sleep_interval", 1),
@@ -126,7 +135,7 @@ class BilibiliDownloader:
             "noplaylist": not is_playlist,
             # 字幕
             "writesubtitles": download_subs,
-            "writeautomaticsub": download_subs,
+            "writeautomaticsub": True,  # 不下载AI字幕(.ai-zh.srt)
             "subtitleslangs": _get("subtitle.languages", ["all"]),
             "subtitlesformat": _get("subtitle.format", "srt"),
             # 用户代理
@@ -134,6 +143,14 @@ class BilibiliDownloader:
         }
         if embed_subs:
             opts["embedsubs"] = True
+        if skip_danmaku:
+            opts.setdefault("extractor_args", {})
+            opts["extractor_args"]["bilibili"] = ["no_danmaku"]
+        if subs_only:
+            opts["skip_download"] = True
+            opts["outtmpl"] = str(
+                _output_dir / "%(title)s_%(id)s.%(ext)s"
+            )
         return opts
 
     # ── 进度回调 ─────────────────────────────
@@ -215,9 +232,10 @@ class BilibiliDownloader:
         is_playlist: bool = False,
         quality: str = "bestvideo+bestaudio",
         info_only: bool = False,
-        download_subs: bool = True,
         embed_subs: bool = False,
+        skip_danmaku: bool = True,
         verbose: bool = False,
+        download_mode: str = "full",
     ) -> bool:
         if is_valid_bv(url):
             url = build_url(url)
@@ -243,15 +261,23 @@ class BilibiliDownloader:
                 return False
 
         opts = self._build_opts(is_playlist=is_playlist, quality=fmt,
-                                download_subs=download_subs,
-                                embed_subs=embed_subs, verbose=verbose)
+                                embed_subs=embed_subs, skip_danmaku=skip_danmaku,
+                                verbose=verbose,
+                                download_mode=download_mode)
 
         try:
             with self.yt_dlp.YoutubeDL(opts) as ydl:
                 logger.info(f"开始下载: {url}")
-                mode = "合集" if is_playlist else "单视频"
-                logger.info(f"模式: {mode}")
+                if download_mode == "subs_only":
+                    logger.info("模式: 仅下载字幕")
+                elif download_mode == "video_only":
+                    logger.info("模式: 仅下载视频")
+                elif is_playlist:
+                    logger.info("模式: 合集")
+                else:
+                    logger.info("模式: 单视频")
                 ydl.download([url])
+                _cleanup_unwanted_files(get_output_dir())
                 logger.info("=" * 60)
                 logger.info(f"下载成功！文件保存在: {get_output_dir()}")
                 return True
@@ -333,9 +359,10 @@ def download_collection_as_individuals(
     downloader: BilibiliDownloader,
     url: str,
     quality: str,
-    download_subs: bool = True,
     embed_subs: bool = False,
+    skip_danmaku: bool = True,
     verbose: bool = False,
+    download_mode: str = "full",
 ):
     """合集下载：先提取所有视频 URL，再逐个按单视频模式下载（确保字幕提取）"""
     from .config import get_output_dir as _gdir, set_output_dir as _sdir, COOKIE_FILE, _get
@@ -360,8 +387,9 @@ def download_collection_as_individuals(
         logger.info("回退到常规合集下载模式...")
         success = downloader.download_video(
             url=url, is_playlist=True, quality=quality,
-            info_only=False, download_subs=download_subs,
-            embed_subs=embed_subs, verbose=verbose,
+            info_only=False,
+            embed_subs=embed_subs, skip_danmaku=skip_danmaku, verbose=verbose,
+            download_mode=download_mode,
         )
         sys.exit(0 if success else 1)
 
@@ -377,7 +405,7 @@ def download_collection_as_individuals(
     logger.info(f"合集「{playlist_title}」共 {total} 个视频")
     logger.info(f"输出目录: {playlist_dir}")
 
-    if download_subs and not COOKIE_FILE.exists():
+    if download_mode != "video_only" and not COOKIE_FILE.exists():
         logger.warning("⚠️  B站字幕需要登录才能下载，请先运行 --cookies-from-browser")
 
     success_count = 0
@@ -416,8 +444,9 @@ def download_collection_as_individuals(
             try:
                 ok = downloader.download_video(
                     url=video_url, is_playlist=False, quality=quality,
-                    info_only=False, download_subs=download_subs,
-                    embed_subs=embed_subs, verbose=verbose,
+                    info_only=False,
+                    embed_subs=embed_subs, skip_danmaku=skip_danmaku, verbose=verbose,
+                    download_mode=download_mode,
                 )
                 if ok:
                     break
@@ -456,12 +485,33 @@ def download_collection_as_individuals(
             logger.info(f"  ⏸  等待 {delay:.1f}s 后继续下一视频...")
             time.sleep(delay)
 
+    if download_mode == "subs_only":
+        desc = "字幕"
+    elif download_mode == "video_only":
+        desc = "视频(无字幕)"
+    else:
+        desc = "视频"
     logger.info(f"\n{'='*60}")
-    logger.info(f"合集下载完成: {success_count}/{total} 个视频成功")
+    logger.info(f"合集下载完成: {success_count}/{total} 个{desc}成功")
     if fail_list:
         logger.warning("失败列表:")
         for f in fail_list:
             logger.warning(f"  - {f}")
     logger.info(f"文件保存在: {playlist_dir}")
     logger.info(f"{'='*60}")
+    # 兜底清理
+    _cleanup_unwanted_files(playlist_dir)
     sys.exit(0 if success_count > 0 else 1)
+
+
+def _cleanup_unwanted_files(directory):
+    """删除不需要的残留文件：弹幕XML、AI字幕"""
+    # patterns = ["*.danmaku.xml", "*.ai-zh.srt"]
+    patterns = ["*.danmaku.xml"]
+    for pattern in patterns:
+        for f in directory.glob(pattern):
+            try:
+                f.unlink()
+                logger.info(f"已清理残留文件: {f.name}")
+            except Exception:
+                pass

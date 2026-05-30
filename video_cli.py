@@ -245,9 +245,11 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
                 # 确定提示词目录（优先使用批次提示词）
                 if batch_name:
                     batches_dir = config.get('paths', {}).get('batches_dir', os.path.join(project_root, "config", "batches"))
-                    prompts_dir = os.path.join(batches_dir, batch_name, "prompts")
+                    batch_dir = os.path.join(batches_dir, batch_name)
+                    prompts_dir = os.path.join(batch_dir, "prompts")
                     logger.info(f"  使用批次提示词: {batch_name}")
                 else:
+                    batch_dir = None
                     prompts_dir = config['paths'].get('prompts_dir', 'config/prompts')
                     logger.info(f"  使用全局提示词")
                 
@@ -258,17 +260,42 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
                         prompt_template = f.read()
                     logger.info(f"  加载提示词模板: {os.path.basename(asr_fix_path)}")
                 
+                # 注入批次术语表路径
+                llm_config = dict(config.get('llm', {}))
+                if batch_dir:
+                    term_path = os.path.join(batch_dir, "terminology.json")
+                    if os.path.exists(term_path):
+                        llm_config['terminology_file'] = term_path
+                        logger.info(f"  注入批次术语表: {term_path}")
+                
                 fused_results = fuse_asr_result(
                     asr_results,
-                    config=config.get('llm', {}),
+                    config=llm_config,
                     prompt_template=prompt_template
                 )
                 logger.success(f"LLM 修正完成")
+                
+                # LLM 驱动的提示词进化（asr_fix.txt）
+                if batch_dir and prompt_template and llm_config.get('api_key') and os.path.exists(asr_fix_path):
+                    try:
+                        from modules.translate.translate_pipeline import evolve_prompt
+                        asr_samples = []
+                        step = max(1, min(len(whisperx_segments), len(fused_results)) // 25)
+                        for k in range(0, min(len(whisperx_segments), len(fused_results)), step):
+                            orig = whisperx_segments[k].get('text', '')
+                            corr = fused_results[k].get('text', '') if k < len(fused_results) else ''
+                            if orig and corr:
+                                asr_samples.append({'input': orig, 'output': corr})
+                        if asr_samples:
+                            evolve_prompt(asr_fix_path, asr_samples, "ASR文本修正", config=llm_config)
+                    except Exception as e:
+                        logger.warning(f"ASR提示词进化跳过（不影响主流程）: {e}")
             except Exception as e:
                 logger.warning(f"LLM 修正失败，使用原始 ASR 结果: {e}")
                 fused_results = whisperx_segments
         else:
             logger.info("\n[STEP 4/6] 跳过 LLM 修正（未配置 API Key）")
+            llm_config = config.get('llm', {})
         
         # STEP 5: 翻译（所有需要中文的模式统一在此翻译）
         final_segments = fused_results
@@ -283,8 +310,10 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
             # 确定提示词目录（优先使用批次提示词）
             if batch_name:
                 batches_dir = config.get('paths', {}).get('batches_dir', os.path.join(project_root, "config", "batches"))
-                prompts_dir = os.path.join(batches_dir, batch_name, "prompts")
+                batch_dir = os.path.join(batches_dir, batch_name)
+                prompts_dir = os.path.join(batch_dir, "prompts")
             else:
+                batch_dir = None
                 prompts_dir = config['paths'].get('prompts_dir', 'config/prompts')
             
             translation_path = os.path.join(prompts_dir, 'translation.txt')
@@ -293,12 +322,37 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
                 with open(translation_path, 'r', encoding='utf-8') as f:
                     prompt_template = f.read()
             
+            # 注入批次术语表路径
+            llm_config = dict(config.get('llm', {}))
+            if batch_dir:
+                term_path = os.path.join(batch_dir, "terminology.json")
+                if os.path.exists(term_path):
+                    llm_config['terminology_file'] = term_path
+                    logger.info(f"  注入批次术语表: {term_path}")
+            
             translated_results = translate_segments(
                 fused_results,
                 target_lang='zh',
-                config=config.get('llm', {}),
+                config=llm_config,
                 prompt_template=prompt_template
             )
+            
+            # LLM 驱动的提示词进化（translation.txt）
+            if batch_dir and prompt_template and llm_config.get('api_key') and os.path.exists(translation_path):
+                try:
+                    from modules.translate.translate_pipeline import evolve_prompt
+                    trans_samples = []
+                    sample_count = min(len(fused_results), len(translated_results))
+                    step = max(1, sample_count // 25)
+                    for k in range(0, sample_count, step):
+                        orig = fused_results[k].get('text', '')
+                        trans = translated_results[k].get('translated_text', '')
+                        if orig and trans:
+                            trans_samples.append({'input': orig, 'output': trans})
+                    if trans_samples:
+                        evolve_prompt(translation_path, trans_samples, "字幕翻译", config=llm_config)
+                except Exception as e:
+                    logger.warning(f"翻译提示词进化跳过（不影响主流程）: {e}")
             
             # 如果是双语模式，保留原文和译文
             if mode == 'subtitle_bilingual':
@@ -366,14 +420,34 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
                 with open(tts_prep_path, 'r', encoding='utf-8') as f:
                     prompt_template = f.read()
             
-            for seg in translated_results:
+            # 并行处理 TTS 文本（每个句子调一次 LLM，I/O 密集型）
+            total_segments = len(translated_results)
+            logger.info(f"TTS 文本预处理，共 {total_segments} 个片段，并行处理中...")
+            
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            
+            def _process_one_tts(idx_seg):
+                idx, seg = idx_seg
                 original_text = seg.get("translated_text", seg["text"])
                 tts_text = process_tts_text(
                     original_text,
-                    config=config.get('llm', {}),
+                    config=llm_config,
                     prompt_template=prompt_template
                 )
-                seg["tts_text"] = tts_text
+                return idx, tts_text
+            
+            max_tts_workers = min(10, total_segments)
+            with ThreadPoolExecutor(max_workers=max_tts_workers) as executor:
+                futures = {executor.submit(_process_one_tts, (idx, seg)): idx
+                          for idx, seg in enumerate(translated_results)}
+                completed = 0
+                for future in as_completed(futures):
+                    idx, tts_text = future.result()
+                    translated_results[idx]["tts_text"] = tts_text
+                    completed += 1
+                    if completed % max(1, total_segments // 10) == 0 or completed == total_segments:
+                        logger.info(f"TTS 文本预处理: {completed}/{total_segments} ({completed*100//total_segments}%)")
+            logger.success(f"TTS 文本预处理完成")
             
             # 生成 TTS 音频
             logger.info("生成 TTS 配音...")
@@ -858,10 +932,10 @@ if __name__ == "__main__":
     # 在这里定义输入输出路径和处理模式
     
     # 输入路径（可以是单个视频文件或包含视频的目录）
-    INPUT_PATH = "/Volumes/mvp/交易场/DeepCharts Course (Fabio & Andrea)- 2025"
+    INPUT_PATH = "/Volumes/mvp/交易场/Lathyrus Trading原始/The Lathyrus Archive/Advanced Theories"
     
     # 输出目录
-    OUTPUT_DIR = "/Volumes/mvp/交易场/DeepCharts Course (Fabio & Andrea)- 2025-中文"
+    OUTPUT_DIR = "/Volumes/mvp/交易场/Lathyrus Trading原始/The Lathyrus Archive/Advanced Theories-中文"
     
     # 处理模式选择：
     # - subtitle_only: 仅生成中文字幕（ASR 识别）

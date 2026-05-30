@@ -126,6 +126,15 @@ class VideoTranslationPipeline:
             else:
                 logger.warning(f"提示词文件不存在: {path}")
                 prompts[key] = ""
+        
+        # 自动检测术语表：prompts 目录的父目录中是否有 terminology.json
+        if 'terminology_file' not in self.config['llm']:
+            parent_dir = os.path.dirname(prompts_dir)
+            term_path = os.path.join(parent_dir, "terminology.json")
+            if os.path.exists(term_path):
+                self.config['llm']['terminology_file'] = term_path
+                logger.info(f"自动检测到批次术语表: {term_path}")
+        
         return prompts
 
     def run(self, video_path, sub_dir=""):

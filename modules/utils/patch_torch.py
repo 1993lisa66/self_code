@@ -6,7 +6,7 @@ from loguru import logger
 def apply_torch_patch():
     """
     针对 PyTorch 2.6+ 的安全加载限制进行全面补丁。
-    强制 weights_only=False 以允许加载包含自定义类的模型（如 WhisperX, NeMo）。
+    强制 weights_only=False 以允许加载包含自定义类的模型（如 WhisperX）。
     """
     try:
         # 1. 尝试添加常见的安全全局变量 (omegaconf 等)

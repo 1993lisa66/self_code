@@ -49,6 +49,12 @@ def main():
   # 下载单个视频
   python bilibili_cli.py BV1xx411c7mD
 
+  # 仅下载字幕（不下载视频）
+  python bilibili_cli.py BV1xx411c7mD --download-mode subs_only
+
+  # 仅下载视频（不下载字幕）
+  python bilibili_cli.py BV1xx411c7mD --download-mode video_only
+
   # 下载整个播放列表
   python bilibili_cli.py https://www.bilibili.com/video/BV1xx411c7mD --playlist
 
@@ -70,8 +76,11 @@ def main():
     parser.add_argument("--info", action="store_true", help="仅查看视频信息，不下载")
     parser.add_argument("--cookie-help", action="store_true", help="显示 Cookie 获取指引")
     parser.add_argument("-o", "--output", metavar="DIR", help="自定义输出目录")
-    parser.add_argument("--no-subs", action="store_true", help="不下载字幕")
+    parser.add_argument("--download-mode", default="full",
+                        choices=["full", "subs_only", "video_only"],
+                        help="下载模式: full(完整) / subs_only(仅字幕) / video_only(仅视频)  (默认: full)")
     parser.add_argument("--embed-subs", action="store_true", help="将字幕嵌入到视频文件中")
+    parser.add_argument("--danmaku", action="store_true", help="下载弹幕文件（默认不下载）")
     parser.add_argument("-v", "--verbose", action="store_true", help="详细调试日志")
 
     args = parser.parse_args()
@@ -109,16 +118,19 @@ def main():
     if is_playlist and not args.info:
         download_collection_as_individuals(
             downloader, url, args.quality,
-            download_subs=not args.no_subs,
             embed_subs=args.embed_subs,
+            skip_danmaku=not args.danmaku,
             verbose=args.verbose,
+            download_mode=args.download_mode,
         )
         return
 
     success = downloader.download_video(
         url=url, is_playlist=is_playlist, quality=args.quality,
-        info_only=args.info, download_subs=not args.no_subs,
-        embed_subs=args.embed_subs, verbose=args.verbose,
+        info_only=args.info,
+        embed_subs=args.embed_subs, skip_danmaku=not args.danmaku,
+        verbose=args.verbose,
+        download_mode=args.download_mode,
     )
     sys.exit(0 if success else 1)
 

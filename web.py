@@ -288,22 +288,17 @@ def start_download():
     data = request.get_json(force=True)
     url = data.get("url", "").strip()
     out_dir = data.get("out_dir", "").strip()
-    mode = data.get("mode", "auto")
     quality = data.get("quality", "best")
-    download_subs = data.get("download_subs", True)
     embed_subs = data.get("embed_subs", False)
+    # 下载模式: full / subs_only / video_only
+    download_mode = data.get("download_mode", "full")
 
     if not url:
         return jsonify({"error": "请输入视频链接"}), 400
     if not out_dir:
         return jsonify({"error": "请指定输出目录"}), 400
 
-    if mode == "single":
-        is_playlist = False
-    elif mode == "playlist":
-        is_playlist = True
-    else:
-        is_playlist = is_playlist_url(url)
+    is_playlist = is_playlist_url(url)
 
     _set_output_dir(Path(out_dir))
     _cancelled = False
@@ -327,12 +322,17 @@ def start_download():
     _put_log("HEADER", "=" * 60)
     _put_log("HEADER", f"🎬 开始下载: {url}")
     _put_log("HEADER", f"📁 输出目录: {out_dir}")
-    _put_log("HEADER", f"🎨 画质: {quality}  |  字幕: {'是' if download_subs else '否'}")
+    if download_mode == "subs_only":
+        _put_log("HEADER", f"📝 模式: 仅下载字幕")
+    elif download_mode == "video_only":
+        _put_log("HEADER", f"🎨 画质: {quality}  |  模式: 仅下载视频")
+    else:
+        _put_log("HEADER", f"🎨 画质: {quality}  |  模式: 完整下载")
     _put_log("HEADER", "=" * 60)
 
     _worker = threading.Thread(
         target=_do_download,
-        args=(url, is_playlist, quality, download_subs, embed_subs,
+        args=(url, is_playlist, quality, embed_subs, download_mode,
               _put_log, _put_progress, _put_video_start,
               _put_video_done, _put_all_done),
         daemon=True,
@@ -349,7 +349,7 @@ def stop_download():
     return jsonify({"status": "stopping"})
 
 
-def _do_download(url, is_playlist, quality, download_subs, embed_subs,
+def _do_download(url, is_playlist, quality, embed_subs, download_mode,
                  put_log, put_progress, put_video_start,
                  put_video_done, put_all_done):
     global _cancelled, _running
@@ -416,8 +416,9 @@ def _do_download(url, is_playlist, quality, download_subs, embed_subs,
                     try:
                         ok = downloader.download_video(
                             url=video_url, is_playlist=False, quality=quality,
-                            info_only=False, download_subs=download_subs,
-                            embed_subs=embed_subs, verbose=False)
+                            info_only=False,
+                            embed_subs=embed_subs, verbose=False,
+                            download_mode=download_mode)
                         if ok:
                             break
                     except (downloader.yt_dlp.utils.DownloadError,
@@ -458,8 +459,9 @@ def _do_download(url, is_playlist, quality, download_subs, embed_subs,
         try:
             ok = downloader.download_video(
                 url=url, is_playlist=False, quality=quality,
-                info_only=False, download_subs=download_subs,
-                embed_subs=embed_subs, verbose=False)
+                info_only=False,
+                embed_subs=embed_subs, verbose=False,
+                download_mode=download_mode)
             elapsed = time.time() - start_time
             put_all_done(1 if ok else 0, 1, [] if ok else ["下载失败"],
                          str(get_output_dir()), elapsed)
