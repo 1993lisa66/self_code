@@ -30,7 +30,8 @@ def generate_chapters(srt_content, config=None, prompt_template=None):
         response = client.chat.completions.create(
             model=model_name,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.1
+            temperature=0.1,
+            max_tokens=500
         )
         
         chapters = response.choices[0].message.content.strip()

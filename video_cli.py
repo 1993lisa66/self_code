@@ -134,6 +134,34 @@ def check_output_exists(video_path, mode, output_dir):
     return False
 
 
+def _check_has_audio(video_path):
+    """
+    快速检查视频文件是否有音频流
+    
+    Returns:
+        (has_audio: bool, has_video: bool)
+    """
+    import subprocess
+    from modules.utils.ffmpeg_utils import get_ffprobe_exe
+    ffprobe_exe = get_ffprobe_exe()
+    
+    try:
+        result = subprocess.run(
+            [ffprobe_exe, "-v", "error",
+             "-show_entries", "stream=codec_type",
+             "-of", "csv=p=0",
+             video_path],
+            capture_output=True, text=True,
+            env=os.environ.copy()
+        )
+        lines = result.stdout.strip().splitlines()
+        has_audio = any("audio" in line for line in lines)
+        has_video = any("video" in line for line in lines)
+        return has_audio, has_video
+    except Exception:
+        return True, True  # 检查失败时假定有音频
+
+
 def process_video_unified(video_path, config, mode='subtitle_only', input_dir='', output_dir='', batch_name=None):
     """
     统一视频处理函数
@@ -174,6 +202,16 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
             'video_path': video_path,
             'status': 'skipped',
             'message': f'输出已存在（模式: {mode}）'
+        }
+    
+    # 快速检查视频是否有音频流
+    has_audio, has_video = _check_has_audio(video_path)
+    if not has_audio:
+        logger.warning(f"⏭️  跳过（无音频流）: {os.path.basename(video_path)}")
+        return {
+            'video_path': video_path,
+            'status': 'skipped',
+            'message': '视频文件没有音频流'
         }
     
     logger.info(f"{'='*60}")
@@ -405,7 +443,7 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
                 raise RuntimeError("翻译步骤缺失")
             
             logger.info("\n[额外步骤] TTS 文本预处理...")
-            from modules.tts.text_processor import process_tts_text
+            from modules.tts.text_processor import process_tts_text_batch
             
             # 确定提示词目录（优先使用批次提示词）
             if batch_name:
@@ -420,33 +458,17 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
                 with open(tts_prep_path, 'r', encoding='utf-8') as f:
                     prompt_template = f.read()
             
-            # 并行处理 TTS 文本（每个句子调一次 LLM，I/O 密集型）
+            # 批量处理 TTS 文本（每批 20 条，内置缓存）
             total_segments = len(translated_results)
-            logger.info(f"TTS 文本预处理，共 {total_segments} 个片段，并行处理中...")
-            
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            
-            def _process_one_tts(idx_seg):
-                idx, seg = idx_seg
-                original_text = seg.get("translated_text", seg["text"])
-                tts_text = process_tts_text(
-                    original_text,
-                    config=llm_config,
-                    prompt_template=prompt_template
-                )
-                return idx, tts_text
-            
-            max_tts_workers = min(10, total_segments)
-            with ThreadPoolExecutor(max_workers=max_tts_workers) as executor:
-                futures = {executor.submit(_process_one_tts, (idx, seg)): idx
-                          for idx, seg in enumerate(translated_results)}
-                completed = 0
-                for future in as_completed(futures):
-                    idx, tts_text = future.result()
-                    translated_results[idx]["tts_text"] = tts_text
-                    completed += 1
-                    if completed % max(1, total_segments // 10) == 0 or completed == total_segments:
-                        logger.info(f"TTS 文本预处理: {completed}/{total_segments} ({completed*100//total_segments}%)")
+            tts_texts = [seg.get("translated_text", seg["text"]) for seg in translated_results]
+            processed = process_tts_text_batch(
+                tts_texts,
+                config=llm_config,
+                prompt_template=prompt_template,
+                batch_size=20
+            )
+            for idx, tts_text in enumerate(processed):
+                translated_results[idx]["tts_text"] = tts_text
             logger.success(f"TTS 文本预处理完成")
             
             # 生成 TTS 音频
@@ -932,10 +954,10 @@ if __name__ == "__main__":
     # 在这里定义输入输出路径和处理模式
     
     # 输入路径（可以是单个视频文件或包含视频的目录）
-    INPUT_PATH = "/Volumes/mvp/交易场/Lathyrus Trading原始/The Lathyrus Archive/Advanced Theories"
+    INPUT_PATH = "/Volumes/mvp/交易场/Lathyrus Trading原始/The Lathyrus Files/Backtesting Sessions"
     
     # 输出目录
-    OUTPUT_DIR = "/Volumes/mvp/交易场/Lathyrus Trading原始/The Lathyrus Archive/Advanced Theories-中文"
+    OUTPUT_DIR = "/Volumes/mvp/交易场/Lathyrus Trading原始/The Lathyrus Files/Backtesting Sessions-中文"
     
     # 处理模式选择：
     # - subtitle_only: 仅生成中文字幕（ASR 识别）
@@ -945,7 +967,7 @@ if __name__ == "__main__":
     PROCESS_MODE = "tts_no_subtitle"
     
     # 批次名称（为空则使用全局配置）
-    BATCH_NAME = "Fabio"  # 例如: "ICT_Trading_Batch1"
+    BATCH_NAME = "Lathyrus_Trading"  # 例如: "ICT_Trading_Batch1"
     
     # ================================================
     

@@ -134,34 +134,18 @@ class PromptTermManager:
             logger.error("LLM 不可用，无法提取术语")
             return {}
         
-        prompt = f"""
-你是一个专业的术语提取专家。请从以下文本中提取专业术语，并翻译成中文。
-
-**要求**：
-1. 只提取专业术语、专有名词、技术词汇
-2. 忽略常见词汇和普通表达
-3. 保持术语的准确性和专业性
-4. 返回 JSON 格式：{{"英文术语": "中文翻译"}}
-5. 如果文本中没有专业术语，返回空对象 {{}}
-
-**领域**：{domain}
-
-**待分析文本**：
-{text[:2000]}  # 限制长度避免超出 token 限制
-
-**输出格式示例**：
-{{
-  "candle": "K线",
-  "FVG": "公允价值缺口",
-  "Order Block": "订单块"
-}}
-"""
+        prompt = (
+            f"从文本提取专业术语→中文。忽略常见词。领域：{domain}\n"
+            f'返回JSON：{{"英文术语":"中文翻译"}}，无术语返回{{}}。\n\n'
+            f"{text[:2000]}"
+        )
         
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.1
+                temperature=0.1,
+                max_tokens=800
             )
             
             content = response.choices[0].message.content.strip()
@@ -211,34 +195,19 @@ class PromptTermManager:
         
         current_prompt = self.load_prompt(prompt_name)
         
-        prompt = f"""
-你是一个专业的提示词工程师。请优化以下提示词模板，使其更加清晰、有效。
-
-**当前提示词**：
-{current_prompt}
-
-**用户反馈**（当前提示词的问题）：
-{feedback if feedback else "无"}
-
-**期望的输出示例**：
-{examples if examples else "无"}
-
-**优化要求**：
-1. 结构清晰，逻辑明确
-2. 指令具体，避免歧义
-3. 包含必要的约束和格式要求
-4. 提供清晰的输出格式示例
-5. 保持简洁，去除冗余内容
-6. 使用 Markdown 格式增强可读性
-
-**请直接返回优化后的提示词内容，不要添加任何解释。**
-"""
+        prompt = (
+            "优化提示词模板，使指令清晰、具体、无歧义。删除冗余。保留所有占位符变量。\n\n"
+            f"当前：\n{current_prompt}\n\n"
+            f"反馈：{feedback or '无'}\n期望示例：{examples or '无'}\n\n"
+            "只返回优化后的提示词，不解释。"
+        )
         
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.3
+                temperature=0.3,
+                max_tokens=1500
             )
             
             optimized = response.choices[0].message.content.strip()

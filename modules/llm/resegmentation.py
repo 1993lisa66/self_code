@@ -43,26 +43,18 @@ def semantic_resegment(fused_results, config=None, prompt_template=None):
             except Exception:
                 prompt = f"请重切分以下文本：\n{combined_text}"
         else:
-            prompt = f"""
-你是一个专业的视频字幕专家。下面是一段 ASR 识别出的文本片段，由于语音识别的限制，很多句子在中间被切断了。
-请根据语义，将这些片段重新组合成自然、完整的句子。
-
-规则：
-1. 必须保留所有原文内容，不得删减或增加。
-2. 将断开的句子合并，并在自然语意结束处（如句号、问号、感叹号）断句。
-3. 返回格式必须为每行一个完整句子，且每行开头保留对应的原始片段索引范围，格式为 "[起始索引-结束索引] 句子内容"。
-   例如："[1-2] 这是合并后的第一句话。" 表示这句话涵盖了原始的第 1 和第 2 个片段。
-   如果一句话只对应一个片段，格式为 "[1-1] 句子内容"。
-4. 确保覆盖所有的原始索引（从 1 到 {len(batch)}）。
-
-待处理文本：
-{combined_text}
-"""
+            prompt = (
+                "合并断开句子为完整句。不删改任何文字。\n"
+                "断句位置：句号/问号/感叹号收尾处。\n"
+                f"输出格式：[起始-结束] 句子内容（覆盖 1-{len(batch)}）\n\n"
+                f"{combined_text}"
+            )
         try:
             response = client.chat.completions.create(
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.1
+                temperature=0.1,
+                max_tokens=1200
             )
             
             content = response.choices[0].message.content.strip()

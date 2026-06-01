@@ -13,10 +13,10 @@ audio:
 global:
   auto_cleanup_cache: true
   max_concurrency:
-    video_processor: 3
+    video_processor: 1
 llm:
   api_base: https://api.siliconflow.cn/v1
-  api_key: sk-zwgrgjgcrqkbtnyghgzebsbeybhnoeozjydrnkzrysghqoxj
+  api_key: sk-ciflsfsoebgnuzsyhsuciwgvqvqosjkasdtsvphzxwttjqmt
   chapter_generator:
     model: deepseek-ai/DeepSeek-V3
     temperature: 0.1

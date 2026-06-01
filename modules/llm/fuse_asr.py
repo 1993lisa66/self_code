@@ -46,6 +46,32 @@ def fuse_asr_result(multi_asr_results, config=None, prompt_template=None):
     
     logger.info(f"总共 {len(whisper_segs)} 个片段，分 {total_batches} 批处理（每批 {batch_size} 个）")
     
+    # 在循环外加载术语表一次（术语表不变，没必要每批重新读取）
+    terminology = {}
+    term_file = config.get('terminology_file', 'terminology.json') if config else 'terminology.json'
+    if os.path.exists(term_file):
+        try:
+            with open(term_file, 'r', encoding='utf-8') as f:
+                terminology = json.load(f)
+        except Exception as e:
+            logger.warning(f"加载术语表失败: {e}")
+            if term_file != 'terminology.json' and os.path.exists('terminology.json'):
+                try:
+                    with open('terminology.json', 'r', encoding='utf-8') as f:
+                        terminology = json.load(f)
+                except:
+                    pass
+    term_str = json.dumps(terminology, ensure_ascii=False) if terminology else "无特殊术语"
+    
+    # 内置默认 prompt 模板（极致精简版）
+    _default_prompt_tpl = (
+        "合并多个ASR结果，选出最准确的版本并优化：\n"
+        f"术语表：{term_str}\n"
+        "修正标点、大小写；去冗余词(um/uh/you know)；英文恢复标准拼写。\n\n"
+        "格式：\"数字: 文本\" 每行一条，共{{count}}行，不解释。\n\n"
+        "{{text}}"
+    )
+    
     try:
         llm_disabled = False  # 一旦遇到余额不足等致命错误，跳过后续所有批次
         for i in range(0, len(whisper_segs), batch_size):
@@ -64,32 +90,12 @@ def fuse_asr_result(multi_asr_results, config=None, prompt_template=None):
             combined_context = ""
             for j, seg in enumerate(batch):
                 global_idx = i + j
-                combined_context += f"片段 {j+1}:\n"
-                combined_context += f"- WhisperX: {seg['text']}\n"
+                parts = [f"[{j+1}] W: {seg['text']}"]
                 for m in ["glm"]:
                     if m in multi_asr_results and global_idx < len(multi_asr_results[m]):
-                        combined_context += f"- {m.capitalize()}: {multi_asr_results[m][global_idx]['text']}\n"
-                combined_context += "\n"
+                        parts.append(f"G: {multi_asr_results[m][global_idx]['text']}")
+                combined_context += " | ".join(parts) + "\n"
 
-            # 加载术语表
-            terminology = {}
-            term_file = config.get('terminology_file', 'terminology.json') if config else 'terminology.json'
-            if os.path.exists(term_file):
-                try:
-                    with open(term_file, 'r', encoding='utf-8') as f:
-                        terminology = json.load(f)
-                except Exception as e:
-                    logger.warning(f"加载术语表失败: {e}")
-                    # 回退到全局术语表
-                    if term_file != 'terminology.json' and os.path.exists('terminology.json'):
-                        try:
-                            with open('terminology.json', 'r', encoding='utf-8') as f:
-                                terminology = json.load(f)
-                        except:
-                            pass
-            
-            term_str = json.dumps(terminology, ensure_ascii=False) if terminology else "无特殊术语"
-            
             # 使用外部提示词模板（如果提供），否则使用内置默认模板
             if prompt_template:
                 try:
@@ -99,54 +105,16 @@ def fuse_asr_result(multi_asr_results, config=None, prompt_template=None):
                         count=len(batch)
                     )
                 except KeyError:
-                    # 模板占位符不匹配，回退到默认
-                    prompt = f"""
-你是一个专业的音频字幕融合专家。下面是多个 ASR 模型对同一段音频的识别结果。
-请选出最准确的内容，并进行以下优化：
-
-1. **术语修正**：参考术语表，确保专有名词和技术词汇准确无误
-   - 术语表：{term_str}
-2. **上下文一致性**：保持前后文的逻辑连贯性
-3. **格式规范**：修正标点符号、大小写、空格等
-4. **长度压缩**：去除冗余词、填充词（如 um, uh, you know），使句子更简洁
-5. **语言标准化**：如果是英文，恢复为标准英文拼写和语法
-
-必须严格遵守以下格式：
-1. 每个片段返回一行，格式为 "数字: 修正后的文本"
-2. 返回的行数必须正好是 {len(batch)} 行
-3. 即使某些片段识别结果一致，也请重复返回
-4. 不要返回任何额外解释或注释
-
-待处理内容：
-{combined_context}
-"""
+                    prompt = _default_prompt_tpl.format(text=combined_context, count=len(batch))
             else:
-                prompt = f"""
-你是一个专业的音频字幕融合专家。下面是多个 ASR 模型对同一段音频的识别结果。
-请选出最准确的内容，并进行以下优化：
-
-1. **术语修正**：参考术语表，确保专有名词和技术词汇准确无误
-   - 术语表：{term_str}
-2. **上下文一致性**：保持前后文的逻辑连贯性
-3. **格式规范**：修正标点符号、大小写、空格等
-4. **长度压缩**：去除冗余词、填充词（如 um, uh, you know），使句子更简洁
-5. **语言标准化**：如果是英文，恢复为标准英文拼写和语法
-
-必须严格遵守以下格式：
-1. 每个片段返回一行，格式为 "数字: 修正后的文本"
-2. 返回的行数必须正好是 {len(batch)} 行
-3. 即使某些片段识别结果一致，也请重复返回
-4. 不要返回任何额外解释或注释
-
-待处理内容：
-{combined_context}
-"""
+                prompt = _default_prompt_tpl.format(text=combined_context, count=len(batch))
 
             try:
                 response = client.chat.completions.create(
                     model=model_name,
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0.1
+                    temperature=0.1,
+                    max_tokens=1200
                 )
                 
                 content = response.choices[0].message.content.strip()
