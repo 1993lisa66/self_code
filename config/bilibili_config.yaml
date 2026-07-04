@@ -16,11 +16,15 @@ cookie:
 network:
   retries: 10
   fragment_retries: 10
-  socket_timeout: 30
-  sleep_interval_requests: 1
-  sleep_interval: 1
-  max_sleep_interval_requests: 3
+  socket_timeout: 60
+  sleep_interval_requests: 2
+  sleep_interval: 2
+  max_sleep_interval_requests: 5
   concurrent_fragment_downloads: 5
+  # 应用层重试（IncompleteRead / ReadTimeout 等网络瞬时错误）
+  app_retries: 5
+  app_retry_base_delay: 5
+  app_retry_max_delay: 60
 
 # ── 合集下载 ──
 collection:
@@ -28,6 +32,10 @@ collection:
   max_delay: 5.0
   max_retries: 3
   retry_delays: [3, 8, 15]
+  list_retries: 5
+  list_retry_base_delay: 3
+  list_retry_max_delay: 60
+  list_socket_timeout: 60
 
 # ── 字幕 ──
 subtitle:

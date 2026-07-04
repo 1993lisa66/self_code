@@ -9,10 +9,17 @@ ffprobe_exe = get_ffprobe_exe()
 
 
 
-def merge_video(video_path, tts_audio, output_dir="outputs", config=None):
+def merge_video(video_path, tts_audio, output_dir="outputs", config=None, output_name=None):
     """
     使用 FFmpeg 合成最终视频：原视频画面 + 新配音（不烧录字幕）。
     增加了视频时长自动补全逻辑，解决音画不同步导致的视频冻结问题。
+
+    Args:
+        video_path: 原始视频路径
+        tts_audio: TTS 配音音频路径
+        output_dir: 输出目录
+        config: 合并配置字典
+        output_name: 输出文件名（不含扩展名），若提供则使用此名称而非视频原名
     """
     video_path = os.path.abspath(video_path)
     tts_audio = os.path.abspath(tts_audio)
@@ -21,7 +28,7 @@ def merge_video(video_path, tts_audio, output_dir="outputs", config=None):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
-    base_name = os.path.splitext(os.path.basename(video_path))[0]
+    base_name = output_name if output_name else os.path.splitext(os.path.basename(video_path))[0]
     output_path = os.path.join(output_dir, f"{base_name}.mp4")
 
     # 获取时长

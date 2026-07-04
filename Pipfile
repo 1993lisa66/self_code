@@ -6,7 +6,6 @@ name = "pypi"
 [packages]
 # ── 核心依赖 ──
 pydub = "*"
-srt = "*"
 
 # ── ML / AI 框架 ──
 torch = "*"
@@ -21,11 +20,8 @@ faster-whisper = "*"
 funasr = "*"
 
 # ── TTS 语音合成 ──
-edge-tts = "*"
-aiofiles = "*"
 
 # ── LLM API ──
-openai = "*"
 
 # ── 可选：备用 FFmpeg 探测 ──
 imageio-ffmpeg = "*"
@@ -33,10 +29,14 @@ imageio-ffmpeg = "*"
 # ── 可选：NVIDIA NeMo ASR（体积庞大，按需安装）──
 # nemo_toolkit = {version = "*", extras = ["all"]}
 flask = "*"
-loguru = "*"
-pyyaml = "*"
 yt-dlp = "*"
 nemo-toolkit = {extras = ["all"], version = "*"}
+srt = "*"
+loguru = "*"
+pyyaml = "*"
+edge-tts = "*"
+aiofiles = "*"
+openai = "*"
 
 [dev-packages]
 

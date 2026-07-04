@@ -62,3 +62,34 @@ def set_output_dir(path: Path):
     global _output_dir
     _output_dir = Path(path)
     _output_dir.mkdir(parents=True, exist_ok=True)
+
+
+# ── API服务器配置（Chrome扩展使用）──
+API_HOST = _get("api.host", "127.0.0.1")
+API_PORT = _get("api.port", 5000)
+API_DEBUG = _get("api.debug", False)
+API_MAX_DOWNLOADS = _get("api.max_downloads", 3)
+API_PROGRESS_RETENTION_HOURS = _get("api.progress_retention_hours", 24)
+
+
+# ── 错误码定义 ──
+class ErrorCode:
+    SUCCESS = 0
+    # Cookie相关
+    ERR_COOKIE_NOT_FOUND = 1001
+    ERR_COOKIE_INVALID = 1002
+    ERR_COOKIE_EXPIRED = 1003
+    # 下载相关
+    ERR_DOWNLOAD_FAILED = 2001
+    ERR_DOWNLOAD_TIMEOUT = 2002
+    ERR_DOWNLOAD_CANCELLED = 2003
+    # 网络相关
+    ERR_NETWORK_UNREACHABLE = 3001
+    ERR_NETWORK_TIMEOUT = 3002
+    # 文件相关
+    ERR_FILE_NOT_FOUND = 4001
+    ERR_FILE_PERMISSION_DENIED = 4002
+    ERR_DISK_SPACE_INSUFFICIENT = 4003
+    # 服务相关
+    ERR_SERVICE_NOT_RUNNING = 5001
+    ERR_SERVICE_INTERNAL_ERROR = 5002

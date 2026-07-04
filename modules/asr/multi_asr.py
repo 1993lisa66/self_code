@@ -187,7 +187,8 @@ def run_multi_asr(audio_path, segments, output_dir="cache/asr", device="cuda", m
                 idx = len(multi_results["glm"])
                 multi_results["glm"].append({"text": whisper_segs[idx]["text"]})
 
-        # 保存结果
+        # 保存结果（确保父目录存在）
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(multi_results, f, ensure_ascii=False, indent=2)
 

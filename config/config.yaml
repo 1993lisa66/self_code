@@ -17,6 +17,8 @@ global:
 llm:
   api_base: https://api.siliconflow.cn/v1
   api_key: sk-ciflsfsoebgnuzsyhsuciwgvqvqosjkasdtsvphzxwttjqmt
+  # 主模型限流时自动降级的备用模型（更轻量，容量更充足）
+  fallback_model: Qwen/Qwen2.5-7B-Instruct
   chapter_generator:
     model: deepseek-ai/DeepSeek-V3
     temperature: 0.1
@@ -52,7 +54,7 @@ translate:
 tts:
   provider: edge
   speed_limit: 1.5
-  voice: zh-CN-XiaoxiaoNeural
+  voice: zh-CN-YunyangNeural
 vad:
   min_silence_duration_ms: 300
   min_speech_duration_ms: 250

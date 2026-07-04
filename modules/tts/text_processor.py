@@ -113,7 +113,7 @@ def process_tts_text(text, config=None, prompt_template=None):
         return text
 
 
-def process_tts_text_batch(texts, config=None, prompt_template=None, batch_size=20):
+def process_tts_text_batch(texts, config=None, prompt_template=None, batch_size=30):
     """
     批量处理 TTS 文本，一次 LLM 调用处理多条，大幅降低 API 调用次数和 token 消耗。
     同时内置文件缓存，相同输入文本不会重复调用 LLM。
@@ -186,7 +186,7 @@ def process_tts_text_batch(texts, config=None, prompt_template=None, batch_size=
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
-                max_tokens=1500
+                max_tokens=2000
             )
             content = response.choices[0].message.content.strip()
             lines = [line.strip() for line in content.split('\n') if line.strip()]
@@ -229,8 +229,8 @@ def process_tts_text_batch(texts, config=None, prompt_template=None, batch_size=
 def _default_batch_prompt(numbered_text, count):
     """默认批量提示词"""
     return (
-        "数字、日期、符号→TTS中文口语。格式：\"数字: 结果\"，"
-        f"共{count}行。不解释。无需转换则原文。\n\n"
+        "数字→中文口语。价格11,234→一万一千两百三十四，2024年→二零二四年，"
+        f"10:30→十点三十分，50%→百分之五十。格式：\"数字: 结果\"，共{count}行，不解释。\n\n"
         f"{numbered_text}"
     )
 

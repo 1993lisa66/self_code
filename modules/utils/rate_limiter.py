@@ -44,9 +44,40 @@ class RateLimiter:
             self.calls.append(time.time())
 
 
+# ── 全局过载检测器 ──
+# 任意模块触发 429 时标记，所有模块检查此标记后可跳过主模型或可选步骤
+_overload_lock = threading.Lock()
+_overload_until = 0.0  # 过载状态过期时间戳（0 表示未过载）
+_OVERLOAD_DURATION = 300  # 过载标记持续 5 分钟后自动清除
+
+
+def mark_model_overloaded():
+    """标记主模型过载（429），通知所有模块降级"""
+    global _overload_until
+    with _overload_lock:
+        _overload_until = time.time() + _OVERLOAD_DURATION
+
+
+def is_model_overloaded():
+    """查询主模型是否处于过载状态"""
+    global _overload_until
+    with _overload_lock:
+        if _overload_until and time.time() < _overload_until:
+            return True
+        _overload_until = 0.0  # 过期自动清除
+        return False
+
+
+def clear_overload():
+    """手动清除过载标记（主模型恢复后调用）"""
+    global _overload_until
+    with _overload_lock:
+        _overload_until = 0.0
+
+
 # 全局速率限制器实例
-# LLM API: 默认每分钟最多15次调用（根据 SiliconFlow 免费配额调整）
-llm_rate_limiter = RateLimiter(max_calls=15, time_window=60.0)
+# LLM API: 默认每分钟最多10次调用（根据 SiliconFlow 免费配额调整）
+llm_rate_limiter = RateLimiter(max_calls=10, time_window=60.0)
 
 # TTS API: 默认每分钟最多30次调用（Edge TTS 限制较宽松）
 tts_rate_limiter = RateLimiter(max_calls=30, time_window=60.0)

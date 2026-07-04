@@ -13,11 +13,12 @@ import time
 import warnings
 import shutil
 from pathlib import Path
+from datetime import datetime
 from loguru import logger
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
 
-# 抑制 numpy/faster_whisper 的 matmul 溢出/除零警告
+# 抑制 numpy/faster_whisper 的 matmul 溢出/除零警告（延迟导入，仅对应模式触发）
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="faster_whisper")
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="numpy")
 
@@ -37,37 +38,97 @@ if os.path.exists(models_dir):
     os.environ["HUGGINGFACE_HUB_CACHE"] = hf_home
     os.environ["MODELSCOPE_CACHE"] = os.path.join(models_dir, "funasr")
     os.environ["WHISPERX_CACHE"] = os.path.join(models_dir, "whisperx")
-    print(f"[OK] 使用本地模型目录: {models_dir}")
 
 # 配置 pydub 的 FFmpeg 路径（必须在导入 pydub 之前）
 from modules.utils.ffmpeg_utils import get_ffmpeg_exe, get_ffprobe_exe
+from modules.utils.rate_limiter import wait_for_llm_api, mark_model_overloaded, is_model_overloaded, clear_overload
 ffmpeg_path = get_ffmpeg_exe()
 ffprobe_path = get_ffprobe_exe()
 
 if os.path.exists(ffmpeg_path):
     os.environ["PATH"] = os.path.dirname(ffmpeg_path) + os.pathsep + os.environ.get("PATH", "")
 
-import nltk
-from modules.utils.patch_torch import apply_torch_patch
-apply_torch_patch()
-
-try:
-    # 设置本地 nltk_data 目录以避开权限和路径问题
-    nltk_data_dir = os.environ["NLTK_DATA"]
-    os.makedirs(nltk_data_dir, exist_ok=True)
-    nltk.data.path = [nltk_data_dir]
-except Exception as e:
-    pass
-
-# 导入功能模块
-from modules.audio.extract_audio import extract_audio
-from modules.vad.vad_pipeline import run_vad
-from modules.asr.multi_asr import run_multi_asr
-from modules.llm.fuse_asr import fuse_asr_result
-from modules.translate.translate_pipeline import translate_segments
+# ── 轻量模块：始终导入（不依赖 GPU/ML 框架） ──
 from modules.subtitle.generate_srt import generate_srt
-from modules.tts.tts_pipeline import generate_tts
 from modules.merge.merge_video import merge_video
+
+# ── 重量级模块：按需延迟导入（tts_from_srt 模式不需要 ASR/VAD/翻译） ──
+_extract_audio = None
+_run_vad = None
+_run_multi_asr = None
+_fuse_asr_result = None
+_translate_segments = None
+_generate_tts = None
+_process_tts_text_batch = None
+_has_torch_patch = False
+
+
+def _ensure_torch_patch():
+    """确保 PyTorch 补丁已应用（仅在需要时触发）"""
+    global _has_torch_patch
+    if not _has_torch_patch:
+        from modules.utils.patch_torch import apply_torch_patch
+        apply_torch_patch()
+        _has_torch_patch = True
+
+
+def _get_extract_audio():
+    global _extract_audio
+    if _extract_audio is None:
+        _ensure_torch_patch()
+        from modules.audio.extract_audio import extract_audio as _fn
+        _extract_audio = _fn
+    return _extract_audio
+
+
+def _get_run_vad():
+    global _run_vad
+    if _run_vad is None:
+        _ensure_torch_patch()
+        from modules.vad.vad_pipeline import run_vad as _fn
+        _run_vad = _fn
+    return _run_vad
+
+
+def _get_run_multi_asr():
+    global _run_multi_asr
+    if _run_multi_asr is None:
+        _ensure_torch_patch()
+        from modules.asr.multi_asr import run_multi_asr as _fn
+        _run_multi_asr = _fn
+    return _run_multi_asr
+
+
+def _get_fuse_asr_result():
+    global _fuse_asr_result
+    if _fuse_asr_result is None:
+        from modules.llm.fuse_asr import fuse_asr_result as _fn
+        _fuse_asr_result = _fn
+    return _fuse_asr_result
+
+
+def _get_translate_segments():
+    global _translate_segments
+    if _translate_segments is None:
+        from modules.translate.translate_pipeline import translate_segments as _fn
+        _translate_segments = _fn
+    return _translate_segments
+
+
+def _get_generate_tts():
+    global _generate_tts
+    if _generate_tts is None:
+        from modules.tts.tts_pipeline import generate_tts as _fn
+        _generate_tts = _fn
+    return _generate_tts
+
+
+def _get_process_tts_text_batch():
+    global _process_tts_text_batch
+    if _process_tts_text_batch is None:
+        from modules.tts.text_processor import process_tts_text_batch as _fn
+        _process_tts_text_batch = _fn
+    return _process_tts_text_batch
 
 
 def load_config():
@@ -110,7 +171,103 @@ def load_config():
         }
 
 
-def check_output_exists(video_path, mode, output_dir):
+# ──────────────────────────────────────────────
+#  处理状态追踪器：记录哪些文件已处理 / 未处理 / 新增
+# ──────────────────────────────────────────────
+
+TRACKER_FILENAME = "processing_state.json"
+
+
+class ProcessingTracker:
+    """
+    持久化处理状态追踪器。
+    在输出目录保存 `processing_state.json`，记录每个视频文件
+    的处理状态、时间、模式等信息。即使缓存被清除，也能知道哪些
+    文件已处理、哪些是新增的、哪些之前失败了。
+    """
+
+    def __init__(self, output_dir, input_dir=None):
+        self.output_dir = output_dir
+        self.input_dir = input_dir
+        self.filepath = os.path.join(output_dir, TRACKER_FILENAME)
+        self.data = self._load()
+
+    def _load(self):
+        if os.path.exists(self.filepath):
+            try:
+                with open(self.filepath, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {"version": 1, "files": {}}
+
+    def save(self):
+        """保存追踪数据到磁盘"""
+        self.data["last_updated"] = datetime.now().isoformat()
+        os.makedirs(self.output_dir, exist_ok=True)
+        with open(self.filepath, 'w', encoding='utf-8') as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=2)
+
+    def _relpath(self, video_path):
+        """计算视频相对路径作为追踪 key"""
+        if self.input_dir and os.path.isdir(self.input_dir):
+            try:
+                return os.path.relpath(video_path, self.input_dir)
+            except ValueError:
+                pass
+        return os.path.basename(video_path)
+
+    def update(self, video_path, result, mode, output_name=None):
+        """更新单个文件的处理记录"""
+        rel = self._relpath(video_path)
+        self.data["files"][rel] = {
+            "status": result.get("status", "unknown"),
+            "mode": mode,
+            "output_name": output_name if output_name else Path(video_path).stem,
+            "processed_at": datetime.now().isoformat(),
+            "message": result.get("message", "")
+        }
+
+    def get_summary(self, video_files):
+        """
+        对比输入文件与历史记录，返回状态摘要。
+
+        Returns:
+            dict: {
+                "total": 总数, "new": 新增, "completed": 已完成,
+                "failed": 之前失败, "skipped": 需跳过
+            }
+        """
+        tracked = set(self.data.get("files", {}).keys())
+        current = {self._relpath(vf) for vf in video_files}
+
+        # 已跟踪且成功的（输出文件仍存在）
+        completed_success = set()
+        # 已跟踪但失败的
+        previously_failed = set()
+        for k in tracked & current:
+            entry = self.data["files"][k]
+            if entry.get("status") == "success":
+                completed_success.add(k)
+            elif entry.get("status") == "failed":
+                previously_failed.add(k)
+
+        new_files = current - tracked
+
+        return {
+            "total": len(video_files),
+            "new": sorted(new_files),
+            "completed": sorted(completed_success),
+            "previously_failed": sorted(previously_failed),
+        }
+
+    def get_entry(self, video_path):
+        """获取单个文件的追踪记录，不存在返回 None"""
+        rel = self._relpath(video_path)
+        return self.data.get("files", {}).get(rel)
+
+
+def check_output_exists(video_path, mode, output_dir, output_name=None):
     """
     检查是否已存在输出文件
     
@@ -118,20 +275,216 @@ def check_output_exists(video_path, mode, output_dir):
         video_path: 视频文件路径
         mode: 处理模式
         output_dir: 输出目录
+        output_name: 翻译后的输出文件名（不含扩展名），若提供则优先检查此名称
     
     Returns:
         bool: True 如果输出已存在，False 否则
     """
-    base_name = Path(video_path).stem
+    base_name = output_name if output_name else Path(video_path).stem
     
     if mode in ['subtitle_only', 'subtitle_bilingual', 'subtitle_chinese']:
         srt_path = os.path.join(output_dir, f"{base_name}.srt")
+        # 同时检查原始名称（兼容历史输出）
+        if not os.path.exists(srt_path):
+            orig_name = Path(video_path).stem
+            srt_path = os.path.join(output_dir, f"{orig_name}.srt")
         return os.path.exists(srt_path)
-    elif mode == 'tts_no_subtitle':
+    elif mode in ['tts_no_subtitle', 'tts_from_srt']:
         synthetic_video = os.path.join(output_dir, f"{base_name}.mp4")
+        if not os.path.exists(synthetic_video):
+            orig_name = Path(video_path).stem
+            synthetic_video = os.path.join(output_dir, f"{orig_name}.mp4")
         return os.path.exists(synthetic_video)
     
     return False
+
+
+# ── 文件名翻译缓存 ──
+_FILENAME_TRANSLATION_CACHE = {}  # {original_name: translated_name}
+_FILENAME_CACHE_PATH = None
+
+
+def _load_translation_cache(cache_path):
+    """加载文件名翻译缓存"""
+    global _FILENAME_TRANSLATION_CACHE, _FILENAME_CACHE_PATH
+    _FILENAME_CACHE_PATH = cache_path
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                _FILENAME_TRANSLATION_CACHE = json.load(f)
+            logger.debug(f"已加载 {len(_FILENAME_TRANSLATION_CACHE)} 条文件名翻译缓存")
+        except Exception:
+            _FILENAME_TRANSLATION_CACHE = {}
+
+
+def _save_translation_cache():
+    """保存文件名翻译缓存"""
+    global _FILENAME_TRANSLATION_CACHE, _FILENAME_CACHE_PATH
+    if _FILENAME_CACHE_PATH:
+        try:
+            with open(_FILENAME_CACHE_PATH, 'w', encoding='utf-8') as f:
+                json.dump(_FILENAME_TRANSLATION_CACHE, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.debug(f"保存翻译缓存失败: {e}")
+
+
+def _translate_filename(name, llm_config):
+    """
+    使用 LLM 将英文文件名翻译为中文。
+    优先级：缓存命中 > API 翻译(带降级) > 原名。
+
+    Args:
+        name: 原始文件名（不含扩展名）
+        llm_config: LLM 配置字典，包含 api_key, api_base, model
+
+    Returns:
+        str: 翻译后的文件名
+    """
+    if not name or not llm_config or not llm_config.get('api_key'):
+        return name
+
+    # 如果文件名已经主要是中文，无需翻译
+    import unicodedata
+    chinese_chars = sum(1 for c in name if 'CJK' in unicodedata.name(c, ''))
+    if chinese_chars > len(name) * 0.3:
+        return name
+
+    # 缓存命中，直接返回
+    if name in _FILENAME_TRANSLATION_CACHE:
+        cached = _FILENAME_TRANSLATION_CACHE[name]
+        logger.debug(f"  文件名翻译(缓存): \"{name}\" → \"{cached}\"")
+        return cached
+
+    import random
+    import time
+    import re
+    max_retries = 2  # 文件名翻译优先级低，减少重试
+    base_delay = 2
+    fallback_model = llm_config.get('fallback_model') if llm_config else None
+    primary_model = llm_config.get('model', 'deepseek-ai/DeepSeek-V3')
+    
+    # 提取编号前缀（如 "01 - ", "02-", "03.", "001_", 等），只翻译正文部分
+    number_prefix_match = re.match(r'^(\d+\s*[-._]\s*)', name)
+    number_prefix = number_prefix_match.group(0) if number_prefix_match else ''
+    text_to_translate = name[number_prefix_match.end():].strip() if number_prefix_match else name
+    
+    # 如果去掉前缀后只剩空文本，无需翻译
+    if not text_to_translate:
+        return name
+    
+    # 全局过载检测：主模型已知不可用，直接启动备用模型
+    if is_model_overloaded() and fallback_model:
+        current_model = fallback_model
+    else:
+        current_model = primary_model
+
+    for attempt in range(max_retries):
+        # 首次失败即切换备用模型（文件名翻译优先级低，不浪费主模型配额）
+        if attempt >= 1 and fallback_model and current_model != fallback_model:
+            current_model = fallback_model
+
+        try:
+            wait_for_llm_api()  # 遵守全局速率限制
+            from openai import OpenAI
+            client = OpenAI(
+                api_key=llm_config['api_key'],
+                base_url=llm_config.get('api_base', 'https://api.siliconflow.cn/v1')
+            )
+
+            response = client.chat.completions.create(
+                model=current_model,
+                messages=[{
+                    'role': 'user',
+                    'content': (
+                        f'请将以下英文标题翻译成简洁的中文（10字以内，意译优先，用词专业自然）：\n'
+                        f'"{text_to_translate}"\n\n只输出翻译结果，不要任何解释或引号。'
+                    )
+                }],
+                max_tokens=30,
+                temperature=0.1
+            )
+            translated = response.choices[0].message.content.strip()
+            translated = translated.strip('"\' 。，, \n\r\t')
+            # 移除文件名不允许的字符
+            translated = re.sub(r'[\\/:*?"<>|]', '', translated)
+            if translated and len(translated) <= 50:
+                # 拼回编号前缀
+                full_translated = number_prefix + translated
+                logger.info(f"  文件名翻译: \"{name}\" → \"{full_translated}\"")
+                _FILENAME_TRANSLATION_CACHE[name] = full_translated
+                _save_translation_cache()
+                # 如果用备用模型成功了且主模型之前被标记过载，尝试清除标记
+                if current_model == fallback_model:
+                    clear_overload()  # 主模型可能已恢复
+                return full_translated
+        except Exception as e:
+            err_msg = str(e)
+            if '429' in err_msg or 'rate' in err_msg.lower():
+                mark_model_overloaded()  # 通知全局
+                delay = (base_delay ** (attempt + 1)) * (0.5 + random.random())
+                logger.debug(f"  翻译限流，{delay:.1f}s 后重试 ({attempt + 1}/{max_retries})")
+                time.sleep(delay)
+                continue
+            logger.warning(f"  文件名翻译失败（使用原名）: {e}")
+            break
+    else:
+        logger.warning(f"  文件名翻译失败（{max_retries}次重试后仍失败，使用原名）")
+
+    return name
+
+
+def _find_srt_file(video_path):
+    """
+    查找视频文件对应的 SRT 字幕文件。
+    按优先级搜索：同名 .srt、中文相关后缀 .chs.srt / .chi.srt / .zh.srt 等
+    
+    Args:
+        video_path: 视频文件路径
+    
+    Returns:
+        str or None: SRT 文件路径
+    """
+    base_dir = os.path.dirname(video_path)
+    base_name = os.path.splitext(os.path.basename(video_path))[0]
+    
+    candidates = [
+        os.path.join(base_dir, f"{base_name}.srt"),
+        os.path.join(base_dir, f"{base_name}.chs.srt"),
+        os.path.join(base_dir, f"{base_name}.chi.srt"),
+        os.path.join(base_dir, f"{base_name}.zh.srt"),
+        os.path.join(base_dir, f"{base_name}.zh-CN.srt"),
+        os.path.join(base_dir, f"{base_name}.zh-Hans.srt"),
+        os.path.join(base_dir, f"{base_name}.cn.srt"),
+    ]
+    
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _parse_srt_to_segments(srt_path):
+    """
+    解析 SRT 字幕文件，返回包含 start/end/text 的 segment 列表。
+    
+    Args:
+        srt_path: SRT 文件路径
+    
+    Returns:
+        list[dict]: [{'start': float, 'end': float, 'text': str}, ...]
+    """
+    import srt
+    segments = []
+    with open(srt_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    for sub in srt.parse(content):
+        segments.append({
+            'start': sub.start.total_seconds(),
+            'end': sub.end.total_seconds(),
+            'text': sub.content.strip(),
+        })
+    logger.info(f"从 SRT 解析到 {len(segments)} 条字幕: {srt_path}")
+    return segments
 
 
 def _check_has_audio(video_path):
@@ -162,7 +515,7 @@ def _check_has_audio(video_path):
         return True, True  # 检查失败时假定有音频
 
 
-def process_video_unified(video_path, config, mode='subtitle_only', input_dir='', output_dir='', batch_name=None):
+def process_video_unified(video_path, config, mode='subtitle_only', input_dir='', output_dir='', batch_name=None, skip_llm_fix=False):
     """
     统一视频处理函数
     
@@ -170,10 +523,11 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
         video_path: 视频文件路径
         config: 配置字典
         mode: 处理模式
-            - subtitle_only: 仅生成中文字幕
+            - subtitle_only: 仅生成中文字幕（ASR 识别）
             - subtitle_bilingual: 生成中英双语字幕
             - subtitle_chinese: 生成中文字幕（翻译后）
-            - tts_no_subtitle: 生成中文配音（默认烧录字幕到视频）
+            - tts_no_subtitle: 生成中文配音（全流程：ASR→翻译→TTS→合成）
+            - tts_from_srt: 从已有中文字幕生成配音（跳过ASR/翻译，直接SRT→TTS→合成）
         input_dir: 输入目录
         output_dir: 输出目录
         batch_name: 批次名称（可选，用于加载批次专属提示词）
@@ -183,6 +537,9 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
     """
     video_path = os.path.abspath(video_path)
     base_name = Path(video_path).stem
+    
+    # 翻译输出文件名（如果 LLM 可用，将英文标题译为中文文件名）
+    output_base_name = _translate_filename(base_name, config.get('llm', {}))
     
     # 计算相对路径用于保持目录结构
     if input_dir and os.path.isdir(input_dir):
@@ -195,39 +552,49 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
     # 确保输出目录存在
     os.makedirs(target_output_dir, exist_ok=True)
     
-    # 检查输出是否已存在
-    if check_output_exists(video_path, mode, target_output_dir):
+    # 检查输出是否已存在（优先检查翻译后的文件名）
+    if check_output_exists(video_path, mode, target_output_dir, output_name=output_base_name):
         logger.info(f"⏭️  跳过（输出已存在）: {os.path.basename(video_path)}")
         return {
             'video_path': video_path,
             'status': 'skipped',
+            'output_name': output_base_name,
             'message': f'输出已存在（模式: {mode}）'
         }
     
-    # 快速检查视频是否有音频流
-    has_audio, has_video = _check_has_audio(video_path)
-    if not has_audio:
-        logger.warning(f"⏭️  跳过（无音频流）: {os.path.basename(video_path)}")
-        return {
-            'video_path': video_path,
-            'status': 'skipped',
-            'message': '视频文件没有音频流'
-        }
+    # 快速检查视频是否有音频流（tts_from_srt 模式依赖字幕而非原音频，跳过检查）
+    if mode != 'tts_from_srt':
+        has_audio, has_video = _check_has_audio(video_path)
+        if not has_audio:
+            logger.warning(f"⏭️  跳过（无音频流）: {os.path.basename(video_path)}")
+            return {
+                'video_path': video_path,
+                'status': 'skipped',
+                'output_name': output_base_name,
+                'message': '视频文件没有音频流'
+            }
     
     logger.info(f"{'='*60}")
     logger.info(f"开始处理视频: {os.path.basename(video_path)}")
     logger.info(f"处理模式: {mode}")
     logger.info(f"{'='*60}")
     
-    # 创建临时缓存目录
+    # 创建临时缓存目录（内部使用原名，避免特殊字符问题）
     cache_dir = os.path.join(project_root, "cache", "video_processor", base_name)
     os.makedirs(cache_dir, exist_ok=True)
+    
+    # ── tts_from_srt 模式：跳过 ASR/翻译，直接从已有字幕生成中文配音 ──
+    if mode == 'tts_from_srt':
+        return _process_tts_from_srt(
+            video_path, base_name, cache_dir, target_output_dir,
+            config, batch_name, output_base_name=output_base_name
+        )
     
     try:
         # STEP 1: 提取音频
         logger.info("\n[STEP 1/6] 提取音频...")
         audio_output_dir = os.path.join(cache_dir, "audio")
-        audio_path = extract_audio(
+        audio_path = _get_extract_audio()(
             video_path,
             output_dir=audio_output_dir,
             sample_rate=config['audio']['sample_rate']
@@ -237,7 +604,7 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
         # STEP 2: VAD 语音切片
         logger.info("\n[STEP 2/6] 语音活动检测 (VAD)...")
         vad_output_dir = os.path.join(cache_dir, "vad")
-        segments = run_vad(
+        segments = _get_run_vad()(
             audio_path,
             output_dir=vad_output_dir,
             device=config['asr']['device']
@@ -249,13 +616,14 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
             return {
                 'video_path': video_path,
                 'status': 'failed',
+                'output_name': output_base_name,
                 'message': '未检测到语音片段'
             }
         
         # STEP 3: ASR 识别
         logger.info("\n[STEP 3/6] 自动语音识别 (ASR)...")
         asr_output_dir = os.path.join(cache_dir, "asr")
-        asr_results = run_multi_asr(
+        asr_results = _get_run_multi_asr()(
             audio_path,
             segments,
             output_dir=asr_output_dir,
@@ -270,6 +638,7 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
             return {
                 'video_path': video_path,
                 'status': 'failed',
+                'output_name': output_base_name,
                 'message': 'ASR 识别结果为空'
             }
         
@@ -277,7 +646,7 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
         
         # STEP 4: LLM 修正
         fused_results = whisperx_segments
-        if config.get('llm', {}).get('api_key'):
+        if config.get('llm', {}).get('api_key') and not skip_llm_fix:
             logger.info("\n[STEP 4/6] LLM 修正字幕文本...")
             try:
                 # 确定提示词目录（优先使用批次提示词）
@@ -306,7 +675,7 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
                         llm_config['terminology_file'] = term_path
                         logger.info(f"  注入批次术语表: {term_path}")
                 
-                fused_results = fuse_asr_result(
+                fused_results = _get_fuse_asr_result()(
                     asr_results,
                     config=llm_config,
                     prompt_template=prompt_template
@@ -332,7 +701,10 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
                 logger.warning(f"LLM 修正失败，使用原始 ASR 结果: {e}")
                 fused_results = whisperx_segments
         else:
-            logger.info("\n[STEP 4/6] 跳过 LLM 修正（未配置 API Key）")
+            if skip_llm_fix:
+                logger.info("\n[STEP 4/6] 跳过 LLM 修正（已配置 SKIP_LLM_FIX=True）")
+            else:
+                logger.info("\n[STEP 4/6] 跳过 LLM 修正（未配置 API Key）")
             llm_config = config.get('llm', {})
         
         # STEP 5: 翻译（所有需要中文的模式统一在此翻译）
@@ -368,7 +740,7 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
                     llm_config['terminology_file'] = term_path
                     logger.info(f"  注入批次术语表: {term_path}")
             
-            translated_results = translate_segments(
+            translated_results = _get_translate_segments()(
                 fused_results,
                 target_lang='zh',
                 config=llm_config,
@@ -407,7 +779,7 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
         # STEP 6: 生成 SRT 字幕
         if mode in ['subtitle_only', 'subtitle_bilingual', 'subtitle_chinese', 'tts_no_subtitle']:
             logger.info("\n[STEP 6/6] 生成 SRT 字幕...")
-            srt_output_path = os.path.join(target_output_dir, f"{base_name}.srt")
+            srt_output_path = os.path.join(target_output_dir, f"{output_base_name}.srt")
             
             # 对于双语模式，使用特殊格式
             if mode == 'subtitle_bilingual':
@@ -461,11 +833,11 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
             # 批量处理 TTS 文本（每批 20 条，内置缓存）
             total_segments = len(translated_results)
             tts_texts = [seg.get("translated_text", seg["text"]) for seg in translated_results]
-            processed = process_tts_text_batch(
+            processed = _get_process_tts_text_batch()(
                 tts_texts,
                 config=llm_config,
                 prompt_template=prompt_template,
-                batch_size=20
+                batch_size=30
             )
             for idx, tts_text in enumerate(processed):
                 translated_results[idx]["tts_text"] = tts_text
@@ -475,7 +847,7 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
             logger.info("生成 TTS 配音...")
             tts_output_dir = os.path.join(cache_dir, "tts")
             import asyncio
-            tts_audio = asyncio.run(generate_tts(
+            tts_audio = asyncio.run(_get_generate_tts()(
                 translated_results,
                 output_dir=tts_output_dir,
                 voice=config['tts']['voice'],
@@ -492,7 +864,8 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
                 video_path,
                 tts_audio,
                 output_dir=target_output_dir,
-                config=merge_config
+                config=merge_config,
+                output_name=output_base_name
             )
             logger.success(f"最终视频生成完成: {final_video}")
         
@@ -514,12 +887,13 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
         # )
         
         logger.info(f"{'='*60}")
-        logger.success(f"视频 [{base_name}] 处理完成！")
+        logger.success(f"视频 [{output_base_name}] 处理完成！")
         logger.info(f"{'='*60}\n")
         
         return {
             'video_path': video_path,
             'status': 'success',
+            'output_name': output_base_name,
             'srt_path': srt_path,
             'tts_audio': tts_audio,
             'final_video': final_video,
@@ -533,6 +907,7 @@ def process_video_unified(video_path, config, mode='subtitle_only', input_dir=''
         return {
             'video_path': video_path,
             'status': 'failed',
+            'output_name': output_base_name,
             'message': str(e)
         }
         
@@ -699,21 +1074,171 @@ def _generate_reports(video_path, target_output_dir, base_name, srt_path, mode,
     logger.info(f"  ✓ result.json: {result_path}")
 
 
+def _process_tts_from_srt(video_path, base_name, cache_dir, target_output_dir, config, batch_name, output_base_name=None):
+    """
+    tts_from_srt 模式：从已有中文字幕直接生成中文配音并合成视频。
+    
+    跳过 ASR 识别和翻译步骤，直接：SRT 解析 → TTS 文本预处理 → 合成配音 → 合并视频。
+    
+    Args:
+        video_path: 视频文件路径
+        base_name: 原始基础文件名（用于内部日志/缓存）
+        cache_dir: 缓存目录
+        target_output_dir: 输出目录
+        config: 配置字典
+        batch_name: 批次名称
+        output_base_name: 翻译后的输出文件名（不含扩展名），若提供则用于输出文件命名
+    
+    Returns:
+        dict: 处理结果
+    """
+    # 使用翻译后的文件名替换输出名
+    use_name = output_base_name if output_base_name else base_name
+    logger.info("模式: tts_from_srt（从已有字幕生成配音）")
+    
+    try:
+        # STEP 1: 查找并解析 SRT 文件
+        logger.info("\n[STEP 1/4] 查找中文字幕文件...")
+        srt_path = _find_srt_file(video_path)
+        if not srt_path:
+            logger.error(f"未找到匹配的 SRT 字幕文件: {video_path}")
+            return {
+                'video_path': video_path,
+                'status': 'failed',
+                'output_name': use_name,
+                'message': f'未找到匹配的 SRT 字幕文件（请确保字幕文件与视频同名，放在同一目录下）'
+            }
+        logger.info(f"  找到字幕: {srt_path}")
+        
+        segments = _parse_srt_to_segments(srt_path)
+        if not segments:
+            logger.error("SRT 文件解析为空")
+            return {
+                'video_path': video_path,
+                'status': 'failed',
+                'output_name': use_name,
+                'message': 'SRT 文件解析为空'
+            }
+        logger.success(f"字幕解析完成，共 {len(segments)} 条")
+        
+        # STEP 2: TTS 文本预处理
+        logger.info("\n[STEP 2/4] TTS 文本预处理...")
+        
+        project_root_dir = os.path.dirname(os.path.abspath(__file__))
+        if batch_name:
+            batches_dir = config.get('paths', {}).get('batches_dir', os.path.join(project_root_dir, "config", "batches"))
+            prompts_dir = os.path.join(batches_dir, batch_name, "prompts")
+        else:
+            prompts_dir = config['paths'].get('prompts_dir', os.path.join(project_root_dir, 'config', 'prompts'))
+        
+        tts_prep_path = os.path.join(prompts_dir, 'tts_prep.txt')
+        prompt_template = ""
+        if os.path.exists(tts_prep_path):
+            with open(tts_prep_path, 'r', encoding='utf-8') as f:
+                prompt_template = f.read()
+            logger.info(f"  加载 TTS 预处理模板: {os.path.basename(tts_prep_path)}")
+        
+        llm_config = dict(config.get('llm', {}))
+        if batch_name:
+            batches_dir = config.get('paths', {}).get('batches_dir', os.path.join(project_root_dir, "config", "batches"))
+            batch_dir = os.path.join(batches_dir, batch_name)
+            term_path = os.path.join(batch_dir, "terminology.json")
+            if os.path.exists(term_path):
+                llm_config['terminology_file'] = term_path
+                logger.info(f"  注入批次术语表: {term_path}")
+        
+        tts_texts = [seg['text'] for seg in segments]
+        processed = _get_process_tts_text_batch()(
+            tts_texts,
+            config=llm_config,
+            prompt_template=prompt_template,
+            batch_size=20
+        )
+        for idx, tts_text in enumerate(processed):
+            segments[idx]["tts_text"] = tts_text
+            segments[idx]["translated_text"] = tts_text  # 兼容 TTS 模块
+        
+        logger.success(f"TTS 文本预处理完成")
+        
+        # STEP 3: 生成 TTS 配音
+        logger.info("\n[STEP 3/4] 生成 TTS 中文配音...")
+        tts_output_dir = os.path.join(cache_dir, "tts")
+        import asyncio
+        tts_audio = asyncio.run(_get_generate_tts()(
+            segments,
+            output_dir=tts_output_dir,
+            voice=config['tts']['voice'],
+            config=config['tts']
+        ))
+        logger.success(f"TTS 配音生成完成: {tts_audio}")
+        
+        # STEP 4: 合并音频到视频
+        logger.info("\n[STEP 4/4] 合成最终视频...")
+        merge_config = config.get('video', {}).copy()
+        final_video = merge_video(
+            video_path,
+            tts_audio,
+            output_dir=target_output_dir,
+            config=merge_config,
+            output_name=use_name
+        )
+        logger.success(f"最终视频生成完成: {final_video}")
+        
+        # 生成 SRT（重写时间轴为 TTS 实际时长对齐的版本）
+        logger.info("\n[额外步骤] 生成对齐后的 SRT 字幕...")
+        srt_output_path = os.path.join(target_output_dir, f"{use_name}.srt")
+        srt_path_out = generate_srt(segments, output_path=srt_output_path)
+        logger.success(f"对齐版 SRT 生成完成: {srt_path_out}")
+        
+        logger.info(f"{'='*60}")
+        logger.success(f"视频 [{use_name}] tts_from_srt 处理完成！")
+        logger.info(f"{'='*60}\n")
+        
+        return {
+            'video_path': video_path,
+            'status': 'success',
+            'output_name': use_name,
+            'srt_path': srt_path_out,
+            'tts_audio': tts_audio,
+            'final_video': final_video,
+            'message': '成功（从已有字幕生成配音）'
+        }
+        
+    except Exception as e:
+        logger.error(f"tts_from_srt 处理 {video_path} 时出错: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {
+            'video_path': video_path,
+            'status': 'failed',
+            'output_name': use_name,
+            'message': str(e)
+        }
+    finally:
+        # 清理缓存
+        try:
+            if os.path.exists(cache_dir):
+                shutil.rmtree(cache_dir)
+                logger.debug(f"已清理缓存目录: {cache_dir}")
+        except Exception as e:
+            logger.warning(f"清理缓存失败: {e}")
+
+
 def process_single_video(args):
     """
     包装函数，用于多进程调用
     
     Args:
-        args: (video_path, config, mode, input_dir, output_dir, batch_name) 元组
+        args: (video_path, config, mode, input_dir, output_dir, batch_name, skip_llm_fix) 元组
     
     Returns:
         dict: 处理结果
     """
-    video_path, config, mode, input_dir, output_dir, batch_name = args
-    return process_video_unified(video_path, config, mode, input_dir, output_dir, batch_name)
+    video_path, config, mode, input_dir, output_dir, batch_name, skip_llm_fix = args
+    return process_video_unified(video_path, config, mode, input_dir, output_dir, batch_name, skip_llm_fix=skip_llm_fix)
 
 
-def main(input_path=None, output_dir=None, mode=None, batch_name=None):
+def main(input_path=None, output_dir=None, mode=None, batch_name=None, skip_llm_fix=False):
     """
     主函数
     
@@ -755,7 +1280,8 @@ def main(input_path=None, output_dir=None, mode=None, batch_name=None):
     # - subtitle_only: 仅生成中文字幕（ASR 识别）
     # - subtitle_bilingual: 生成中英双语字幕
     # - subtitle_chinese: 生成中文字幕（翻译后）
-    # - tts_no_subtitle: 生成中文配音（默认烧录字幕到视频）
+    # - tts_no_subtitle: 生成中文配音（全流程：ASR→翻译→TTS→合成）
+    # - tts_from_srt: 从已有中文字幕生成配音（跳过ASR/翻译，直接SRT→TTS→合成）
     DEFAULT_MODE = "subtitle_only"
     
     # ====================================================
@@ -768,7 +1294,8 @@ def main(input_path=None, output_dir=None, mode=None, batch_name=None):
         'subtitle_only',
         'subtitle_bilingual',
         'subtitle_chinese',
-        'tts_no_subtitle'
+        'tts_no_subtitle',
+        'tts_from_srt'
     ], default=None, help='处理模式')
     parser.add_argument('--output', '-o', default=None, help='输出目录')
     
@@ -789,7 +1316,8 @@ def main(input_path=None, output_dir=None, mode=None, batch_name=None):
         'subtitle_only': '仅生成中文字幕（ASR 识别）',
         'subtitle_bilingual': '生成中英双语字幕',
         'subtitle_chinese': '生成中文字幕（翻译后）',
-        'tts_no_subtitle': '生成中文配音（默认烧录字幕到视频）'
+        'tts_no_subtitle': '生成中文配音（全流程：ASR→翻译→TTS→合成）',
+        'tts_from_srt': '从已有中文字幕生成配音（跳过ASR/翻译，直接SRT→TTS→合成）'
     }
     print(f"💡 模式说明: {mode_descriptions[final_mode]}\n")
     
@@ -810,8 +1338,9 @@ def main(input_path=None, output_dir=None, mode=None, batch_name=None):
             logger.error(f"不支持的文件格式: {final_input_path}")
             return
     elif os.path.isdir(final_input_path):
+        escaped_input = glob.escape(final_input_path)
         for ext in VIDEO_EXTENSIONS:
-            video_files.extend(glob.glob(os.path.join(final_input_path, f"**/*{ext}"), recursive=True))
+            video_files.extend(glob.glob(os.path.join(escaped_input, f"**/*{ext}"), recursive=True))
     
     if not video_files:
         logger.warning(f"在 {final_input_path} 中未找到视频文件")
@@ -819,6 +1348,29 @@ def main(input_path=None, output_dir=None, mode=None, batch_name=None):
         return
     
     print(f"共找到 {len(video_files)} 个视频文件待处理。\n")
+    
+    # ── 加载处理状态追踪器，显示历史处理情况 ──
+    tracker = ProcessingTracker(final_output_dir, input_dir=final_input_path if os.path.isdir(final_input_path) else None)
+    
+    # ── 加载文件名翻译缓存 ──
+    _load_translation_cache(os.path.join(final_output_dir, "filename_translations.json"))
+    
+    if len(video_files) > 1 or os.path.isdir(final_input_path):
+        summary = tracker.get_summary(video_files)
+        
+        if summary["completed"]:
+            print(f"📋 已处理成功: {len(summary['completed'])} 个（将跳过）")
+        if summary["previously_failed"]:
+            print(f"⚠️  之前失败需重试: {len(summary['previously_failed'])} 个")
+        if summary["new"]:
+            print(f"🆕 新增待处理: {len(summary['new'])} 个")
+        
+        if not summary["new"] and not summary["previously_failed"] and summary["completed"]:
+            print(f"✅ 所有 {len(video_files)} 个文件均已处理完成！")
+            print(f"   如需重新处理，请删除输出文件后重试。")
+            return
+        
+        print()
     
     # 加载配置（需要在批次检查之前加载）
     config = load_config()
@@ -884,8 +1436,8 @@ def main(input_path=None, output_dir=None, mode=None, batch_name=None):
     logger.info(f"  - 并行进程数: {max_workers}")
     logger.info(f"\n")
     
-    # 准备参数列表（包含 batch_name）
-    task_args = [(video_file, config, final_mode, final_input_path, final_output_dir, final_batch_name) for video_file in video_files]
+    # 准备参数列表（包含 batch_name 和 skip_llm_fix）
+    task_args = [(video_file, config, final_mode, final_input_path, final_output_dir, final_batch_name, skip_llm_fix) for video_file in video_files]
     
     # 多进程处理（所有模式都使用多进程）
     print(f"🚀 启动多进程处理模式（{max_workers} 个进程）\n")
@@ -947,6 +1499,23 @@ def main(input_path=None, output_dir=None, mode=None, batch_name=None):
         for r in results:
             if r['status'] == 'failed':
                 print(f"   - {os.path.basename(r['video_path'])}: {r.get('message', '未知错误')}")
+    
+    # ── 更新处理状态追踪器 ──
+    updated_count = 0
+    for result in results:
+        if result['status'] in ('success', 'failed'):
+            tracker.update(
+                result['video_path'],
+                result,
+                final_mode,
+                output_name=result.get('output_name')
+            )
+            updated_count += 1
+    if updated_count > 0:
+        tracker.save()
+        _save_translation_cache()
+        print(f"\n📝 处理状态已保存: {tracker.filepath}（{updated_count} 条记录）")
+        print(f"   下次运行时可查看 {tracker.filepath} 了解处理进度。")
 
 
 if __name__ == "__main__":
@@ -954,20 +1523,24 @@ if __name__ == "__main__":
     # 在这里定义输入输出路径和处理模式
     
     # 输入路径（可以是单个视频文件或包含视频的目录）
-    INPUT_PATH = "/Volumes/mvp/交易场/Lathyrus Trading原始/The Lathyrus Files/Backtesting Sessions"
+    INPUT_PATH = "/Volumes/mvp/[00]交易场/1 Rectangle Trading Strategy"
     
     # 输出目录
-    OUTPUT_DIR = "/Volumes/mvp/交易场/Lathyrus Trading原始/The Lathyrus Files/Backtesting Sessions-中文"
+    OUTPUT_DIR = "/Volumes/mvp/[00]交易场/1 Rectangle Trading Strategy-中文"
     
     # 处理模式选择：
     # - subtitle_only: 仅生成中文字幕（ASR 识别）
     # - subtitle_bilingual: 生成中英双语字幕
     # - subtitle_chinese: 生成中文字幕（翻译后）
-    # - tts_no_subtitle: 生成中文配音（默认烧录字幕到视频）
+    # - tts_no_subtitle: 生成中文配音（全流程：ASR→翻译→TTS→合成）
+    # - tts_from_srt: 从已有中文字幕生成配音（跳过ASR/翻译，直接SRT→TTS→合成）
     PROCESS_MODE = "tts_no_subtitle"
     
     # 批次名称（为空则使用全局配置）
-    BATCH_NAME = "Lathyrus_Trading"  # 例如: "ICT_Trading_Batch1"
+    BATCH_NAME = ""  # 例如: "ICT_Trading_Batch1"
+    
+    # 跳过 Step 4 LLM 修正（True=跳过，直接使用 ASR 原文进入翻译）
+    SKIP_LLM_FIX = False
     
     # ================================================
     
@@ -979,7 +1552,8 @@ if __name__ == "__main__":
         'subtitle_only',
         'subtitle_bilingual',
         'subtitle_chinese',
-        'tts_no_subtitle'
+        'tts_no_subtitle',
+        'tts_from_srt'
     ], default=None, help='处理模式')
     parser.add_argument('--output', '-o', default=None, help='输出目录')
     parser.add_argument('--batch', '-b', default=None, help='批次名称')
@@ -991,5 +1565,6 @@ if __name__ == "__main__":
         input_path=args.input_path if args.input_path else INPUT_PATH,
         output_dir=args.output if args.output else OUTPUT_DIR,
         mode=args.mode if args.mode else PROCESS_MODE,
-        batch_name=args.batch if args.batch else BATCH_NAME
+        batch_name=args.batch if args.batch else BATCH_NAME,
+        skip_llm_fix=SKIP_LLM_FIX
     )

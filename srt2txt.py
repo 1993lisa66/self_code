@@ -4,7 +4,7 @@
 import os
 import re
 
-FOLDER = "/Volumes/mvp/交易场/价格行为/02.价格行为官方视频课"
+FOLDER = "/Volumes/mvp/交易场/ict/合集·【二创】TradingHub3.0"
 
 
 def read_file_auto(path: str) -> str:
@@ -50,7 +50,8 @@ def convert_folder(folder: str):
     txt_path = os.path.join(folder, f"{folder_name}.txt")
 
     all_text = []
-    srt_files = sorted(f for f in os.listdir(folder) if f.lower().endswith(".srt"))
+    srt_files = sorted(f for f in os.listdir(folder)
+                       if f.lower().endswith(".srt") and not f.startswith("._"))
 
     if not srt_files:
         print("未找到 SRT 文件")

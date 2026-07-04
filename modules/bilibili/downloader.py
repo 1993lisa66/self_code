@@ -31,6 +31,7 @@ class BilibiliDownloader:
         self,
         progress_callback: Optional[Callable] = None,
         log_callback: Optional[Callable] = None,
+        cookies_file: Optional[Path] = None,
     ):
         try:
             import yt_dlp
@@ -47,6 +48,9 @@ class BilibiliDownloader:
         self._progress_cb = progress_callback
         self._log_cb = log_callback
         self._cb_lock = threading.Lock()
+        
+        # 自定义cookie文件（用于API模式）
+        self._custom_cookies_file = cookies_file
 
     def set_callbacks(
         self,
@@ -117,6 +121,7 @@ class BilibiliDownloader:
             # 网络设置（从 config.yaml 读取）
             "retries": _get("network.retries", 10),
             "fragment_retries": _get("network.fragment_retries", 10),
+            "extractor_retries": int(_get("network.retries", 10)),
             "ignoreerrors": is_playlist,
             "continuedl": not subs_only,  # 仅字幕时跳过断点续传
             "concurrent_fragment_downloads": _get("network.concurrent_fragment_downloads", 5),
@@ -128,8 +133,10 @@ class BilibiliDownloader:
             "writedescription": False,
             "writeinfojson": False,
             "restrictfilenames": False,
-            # 登录态
-            "cookiefile": str(COOKIE_FILE) if COOKIE_FILE.exists() else None,
+            # 登录态（优先使用自定义cookie文件）
+            "cookiefile": str(self._custom_cookies_file) if self._custom_cookies_file else (
+                str(COOKIE_FILE) if COOKIE_FILE.exists() else None
+            ),
             # 合集/分P
             "playlistend": 0 if not is_playlist else None,
             "noplaylist": not is_playlist,
@@ -207,23 +214,40 @@ class BilibiliDownloader:
             "quiet": not verbose,
             "no_warnings": not verbose,
             "verbose": verbose,
-            "cookiefile": str(COOKIE_FILE) if COOKIE_FILE.exists() else None,
+            "cookiefile": str(self._custom_cookies_file) if self._custom_cookies_file else (
+                str(COOKIE_FILE) if COOKIE_FILE.exists() else None
+            ),
             "writesubtitles": True,
             "writeautomaticsub": True,
             "subtitleslangs": ["all"],
+            "socket_timeout": _get("network.socket_timeout", 60),
+            "retries": _get("network.retries", 10),
         }
-        with self.yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if "entries" in info and info.get("entries"):
-                info["entry_count"] = len(info["entries"])
-                entries = info["entries"]
-                info["entries_preview"] = [
-                    {"title": e.get("title", "未知"),
-                     "duration": e.get("duration", 0),
-                     "id": e.get("id", "")}
-                    for e in entries[:5]
-                ]
-            return info
+        app_retries = _get("network.app_retries", 5)
+        base_delay = _get("network.app_retry_base_delay", 5)
+        max_delay = _get("network.app_retry_max_delay", 60)
+        last_error = None
+        for attempt in range(app_retries):
+            try:
+                with self.yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    if "entries" in info and info.get("entries"):
+                        info["entry_count"] = len(info["entries"])
+                        entries = info["entries"]
+                        info["entries_preview"] = [
+                            {"title": e.get("title", "未知"),
+                             "duration": e.get("duration", 0),
+                             "id": e.get("id", "")}
+                            for e in entries[:5]
+                        ]
+                    return info
+            except Exception as e:
+                last_error = e
+                if attempt < app_retries - 1:
+                    delay = min(base_delay * (2 ** attempt) + random.uniform(1, 3), max_delay)
+                    logger.warning(f"获取信息失败，重试 {attempt+1}/{app_retries}（{delay:.1f}s）: {e}")
+                    time.sleep(delay)
+        raise last_error
 
     # ── 核心下载 ─────────────────────────────
     def download_video(
@@ -236,59 +260,108 @@ class BilibiliDownloader:
         skip_danmaku: bool = True,
         verbose: bool = False,
         download_mode: str = "full",
+        cookies_file: Optional[Path] = None,
     ) -> bool:
-        if is_valid_bv(url):
-            url = build_url(url)
-        elif not url.startswith("http"):
-            logger.error(f"无效的输入: {url}")
-            return False
-
-        format_map = {
-            "best": "bestvideo+bestaudio",
-            "bestvideo+bestaudio": "bestvideo+bestaudio",
-            "1080": "bestvideo[height<=1080]+bestaudio",
-            "720": "bestvideo[height<=720]+bestaudio",
-        }
-        fmt = format_map.get(quality, quality)
-
-        if info_only:
-            try:
-                info = self.get_video_info(url, verbose=verbose)
-                self._print_video_info(info)
-                return True
-            except Exception as e:
-                logger.error(f"获取视频信息失败: {e}")
+        # 如果传入了自定义cookie文件，临时使用它
+        original_custom = self._custom_cookies_file
+        if cookies_file:
+            self._custom_cookies_file = cookies_file
+        
+        try:
+            if is_valid_bv(url):
+                url = build_url(url)
+            elif not url.startswith("http"):
+                logger.error(f"无效的输入: {url}")
                 return False
 
-        opts = self._build_opts(is_playlist=is_playlist, quality=fmt,
-                                embed_subs=embed_subs, skip_danmaku=skip_danmaku,
-                                verbose=verbose,
-                                download_mode=download_mode)
+            format_map = {
+                "best": "bestvideo+bestaudio",
+                "bestvideo+bestaudio": "bestvideo+bestaudio",
+                "1080": "bestvideo[height<=1080]+bestaudio",
+                "720": "bestvideo[height<=720]+bestaudio",
+            }
+            fmt = format_map.get(quality, quality)
 
-        try:
-            with self.yt_dlp.YoutubeDL(opts) as ydl:
-                logger.info(f"开始下载: {url}")
-                if download_mode == "subs_only":
-                    logger.info("模式: 仅下载字幕")
-                elif download_mode == "video_only":
-                    logger.info("模式: 仅下载视频")
-                elif is_playlist:
-                    logger.info("模式: 合集")
-                else:
-                    logger.info("模式: 单视频")
-                ydl.download([url])
-                _cleanup_unwanted_files(get_output_dir())
-                logger.info("=" * 60)
-                logger.info(f"下载成功！文件保存在: {get_output_dir()}")
-                return True
-        except self.yt_dlp.utils.DownloadError as e:
-            logger.error(f"下载失败 (DownloadError): {e}")
-        except self.yt_dlp.utils.ExtractorError as e:
-            logger.error(f"解析失败 (ExtractorError): {e}")
-            logger.error("提示: 该视频可能需要登录才能访问")
-        except Exception as e:
-            logger.error(f"未知错误: {type(e).__name__}: {e}")
-        return False
+            if info_only:
+                try:
+                    info = self.get_video_info(url, verbose=verbose)
+                    self._print_video_info(info)
+                    return True
+                except Exception as e:
+                    logger.error(f"获取视频信息失败: {e}")
+                    return False
+
+            opts = self._build_opts(is_playlist=is_playlist, quality=fmt,
+                                    embed_subs=embed_subs, skip_danmaku=skip_danmaku,
+                                    verbose=verbose,
+                                    download_mode=download_mode)
+
+            app_retries = _get("network.app_retries", 5)
+            base_delay = _get("network.app_retry_base_delay", 5)
+            max_delay = _get("network.app_retry_max_delay", 60)
+
+            permanent_keywords = [
+                "private", "deleted", "copyright", "region locked", "removed",
+                "not found", "404", "forbidden", "unavailable", "invalid",
+                "paid", "requires login", "member only", "fan only",
+            ]
+
+            last_error = None
+            for attempt in range(app_retries):
+                try:
+                    with self.yt_dlp.YoutubeDL(opts) as ydl:
+                        if attempt == 0:
+                            logger.info(f"开始下载: {url}")
+                            if download_mode == "subs_only":
+                                logger.info("模式: 仅下载字幕")
+                            elif download_mode == "video_only":
+                                logger.info("模式: 仅下载视频")
+                            elif is_playlist:
+                                logger.info("模式: 合集")
+                            else:
+                                logger.info("模式: 单视频")
+                        ydl.download([url])
+                        _cleanup_unwanted_files(get_output_dir())
+                        logger.info("=" * 60)
+                        logger.info(f"下载成功！文件保存在: {get_output_dir()}")
+                        return True
+
+                except self.yt_dlp.utils.DownloadError as e:
+                    err_str = str(e).lower()
+                    if any(kw in err_str for kw in permanent_keywords):
+                        logger.error(f"下载失败（不可重试）: {e}")
+                        return False
+                    last_error = e
+                except self.yt_dlp.utils.ExtractorError as e:
+                    err_str = str(e).lower()
+                    if any(kw in err_str for kw in permanent_keywords):
+                        logger.error(f"解析失败（不可重试）: {e}")
+                        return False
+                    logger.error(f"解析失败 (ExtractorError): {e}")
+                    logger.error("提示: 该视频可能需要登录才能访问")
+                    last_error = e
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if any(kw in err_str for kw in permanent_keywords):
+                        logger.error(f"未知错误（不可重试）: {type(e).__name__}: {e}")
+                        return False
+                    last_error = e
+
+                if attempt < app_retries - 1:
+                    delay = min(base_delay * (2 ** attempt) + random.uniform(1, 5), max_delay)
+                    logger.warning(
+                        f"网络错误，第 {attempt+1}/{app_retries} 次重试"
+                        f"（{delay:.1f}s 后）: {last_error}"
+                    )
+                    time.sleep(delay)
+
+            logger.error(f"重试 {app_retries} 次后仍然失败: {last_error}")
+            return False
+
+        finally:
+            # 恢复原始cookie设置
+            if cookies_file:
+                self._custom_cookies_file = original_custom
 
     # ── 合集下载 ─────────────────────────────
     def download_collection(self, collection_id: str,
@@ -377,21 +450,48 @@ def download_collection_as_individuals(
         "noplaylist": False,
         "extract_flat": "in_playlist",
         "cookiefile": str(COOKIE_FILE) if COOKIE_FILE.exists() else None,
+        "socket_timeout": int(_get("collection.list_socket_timeout", 60)),
+        "extractor_retries": int(_get("network.retries", 10)),
     }
 
-    try:
-        with downloader.yt_dlp.YoutubeDL(extract_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as e:
-        logger.error(f"获取合集信息失败: {e}")
-        logger.info("回退到常规合集下载模式...")
-        success = downloader.download_video(
-            url=url, is_playlist=True, quality=quality,
-            info_only=False,
-            embed_subs=embed_subs, skip_danmaku=skip_danmaku, verbose=verbose,
-            download_mode=download_mode,
-        )
-        sys.exit(0 if success else 1)
+    list_retries = int(_get("collection.list_retries", 5))
+    base_delay = float(_get("collection.list_retry_base_delay", 3))
+    max_delay = float(_get("collection.list_retry_max_delay", 60))
+    info = None
+
+    for attempt in range(list_retries):
+        try:
+            with downloader.yt_dlp.YoutubeDL(extract_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            break
+        except Exception as e:
+            err_str = str(e).lower()
+            if any(kw in err_str for kw in
+                   ["private", "deleted", "404", "not found", "forbidden",
+                    "unavailable", "invalid", "copyright"]):
+                logger.error(f"获取合集信息失败（不可重试）: {e}")
+                logger.info("回退到常规合集下载模式...")
+                success = downloader.download_video(
+                    url=url, is_playlist=True, quality=quality,
+                    info_only=False,
+                    embed_subs=embed_subs, skip_danmaku=skip_danmaku, verbose=verbose,
+                    download_mode=download_mode,
+                )
+                sys.exit(0 if success else 1)
+            if attempt < list_retries - 1:
+                delay = min(base_delay * (2 ** attempt) + random.uniform(1, 3), max_delay)
+                logger.warning(f"获取合集列表失败，重试 {attempt+1}/{list_retries}（{delay:.1f}s）: {e}")
+                time.sleep(delay)
+            else:
+                logger.error(f"重试 {list_retries} 次后仍无法获取合集列表: {e}")
+                logger.info("回退到常规合集下载模式...")
+                success = downloader.download_video(
+                    url=url, is_playlist=True, quality=quality,
+                    info_only=False,
+                    embed_subs=embed_subs, skip_danmaku=skip_danmaku, verbose=verbose,
+                    download_mode=download_mode,
+                )
+                sys.exit(0 if success else 1)
 
     entries = info.get("entries", [])
     if not entries:
