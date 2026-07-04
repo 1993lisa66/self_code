@@ -299,33 +299,8 @@ def check_output_exists(video_path, mode, output_dir, output_name=None):
     return False
 
 
-# ── 文件名翻译缓存 ──
+# ── 文件名翻译缓存（仅内存，不写文件） ──
 _FILENAME_TRANSLATION_CACHE = {}  # {original_name: translated_name}
-_FILENAME_CACHE_PATH = None
-
-
-def _load_translation_cache(cache_path):
-    """加载文件名翻译缓存"""
-    global _FILENAME_TRANSLATION_CACHE, _FILENAME_CACHE_PATH
-    _FILENAME_CACHE_PATH = cache_path
-    if os.path.exists(cache_path):
-        try:
-            with open(cache_path, 'r', encoding='utf-8') as f:
-                _FILENAME_TRANSLATION_CACHE = json.load(f)
-            logger.debug(f"已加载 {len(_FILENAME_TRANSLATION_CACHE)} 条文件名翻译缓存")
-        except Exception:
-            _FILENAME_TRANSLATION_CACHE = {}
-
-
-def _save_translation_cache():
-    """保存文件名翻译缓存"""
-    global _FILENAME_TRANSLATION_CACHE, _FILENAME_CACHE_PATH
-    if _FILENAME_CACHE_PATH:
-        try:
-            with open(_FILENAME_CACHE_PATH, 'w', encoding='utf-8') as f:
-                json.dump(_FILENAME_TRANSLATION_CACHE, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.debug(f"保存翻译缓存失败: {e}")
 
 
 def _translate_filename(name, llm_config):
@@ -412,7 +387,6 @@ def _translate_filename(name, llm_config):
                 full_translated = number_prefix + translated
                 logger.info(f"  文件名翻译: \"{name}\" → \"{full_translated}\"")
                 _FILENAME_TRANSLATION_CACHE[name] = full_translated
-                _save_translation_cache()
                 # 如果用备用模型成功了且主模型之前被标记过载，尝试清除标记
                 if current_model == fallback_model:
                     clear_overload()  # 主模型可能已恢复
@@ -1352,9 +1326,6 @@ def main(input_path=None, output_dir=None, mode=None, batch_name=None, skip_llm_
     # ── 加载处理状态追踪器，显示历史处理情况 ──
     tracker = ProcessingTracker(final_output_dir, input_dir=final_input_path if os.path.isdir(final_input_path) else None)
     
-    # ── 加载文件名翻译缓存 ──
-    _load_translation_cache(os.path.join(final_output_dir, "filename_translations.json"))
-    
     if len(video_files) > 1 or os.path.isdir(final_input_path):
         summary = tracker.get_summary(video_files)
         
@@ -1513,7 +1484,6 @@ def main(input_path=None, output_dir=None, mode=None, batch_name=None, skip_llm_
             updated_count += 1
     if updated_count > 0:
         tracker.save()
-        _save_translation_cache()
         print(f"\n📝 处理状态已保存: {tracker.filepath}（{updated_count} 条记录）")
         print(f"   下次运行时可查看 {tracker.filepath} 了解处理进度。")
 
@@ -1523,10 +1493,10 @@ if __name__ == "__main__":
     # 在这里定义输入输出路径和处理模式
     
     # 输入路径（可以是单个视频文件或包含视频的目录）
-    INPUT_PATH = "/Volumes/mvp/[00]交易场/1 Rectangle Trading Strategy"
+    INPUT_PATH = "/Volumes/mvp/[00]交易场/edgeskool"
     
     # 输出目录
-    OUTPUT_DIR = "/Volumes/mvp/[00]交易场/1 Rectangle Trading Strategy-中文"
+    OUTPUT_DIR = "/Volumes/mvp/[00]交易场/edgeskool-中文"
     
     # 处理模式选择：
     # - subtitle_only: 仅生成中文字幕（ASR 识别）
