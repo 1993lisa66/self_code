@@ -128,100 +128,171 @@ def _google_translate_single(text, dest='zh-cn', max_retries=2, translator_insta
     return None, translator_instance
 
 
+def _parse_llm_translation_response(content, batch_size):
+    """解析 LLM 翻译响应，返回 {batch_index: translated_text} 字典。"""
+    lines = [line.strip() for line in content.split('\n') if line.strip()]
+    temp_map = {}
+    for line in lines:
+        match = re.match(r'^(\d+)\s*[:：]\s*(.*)$', line)
+        if match:
+            idx = int(match.group(1)) - 1
+            cleaned = _clean_llm_line(match.group(2).strip())
+            if cleaned:
+                temp_map[idx] = cleaned
+        elif ":" in line:
+            try:
+                idx_str, content_part = line.split(":", 1)
+                idx = int(re.sub(r'\D', '', idx_str)) - 1
+                cleaned = _clean_llm_line(content_part.strip())
+                if cleaned:
+                    temp_map[idx] = cleaned
+            except:
+                pass
+    # 行数匹配时按顺序补齐缺失条目
+    for j in range(batch_size):
+        if j not in temp_map and len(lines) == batch_size:
+            if ":" in lines[j]:
+                _, temp_map[j] = lines[j].split(":", 1)
+                temp_map[j] = temp_map[j].strip()
+            else:
+                temp_map[j] = lines[j]
+    return temp_map
+
+
+def _commit_translated_segments(batch, temp_map, batch_size, batch_num, total_batches):
+    """将解析后的译文提交到结果列表，缺失条目用 Google 翻译兜底。"""
+    results = []
+    for j in range(min(batch_size, len(batch))):
+        seg = batch[j]
+        translated_text = temp_map.get(j)
+        if not translated_text:
+            logger.warning(
+                f"翻译批次 {batch_num}/{total_batches} 片段 {j+1} 译文缺失，"
+                f"尝试 Google 翻译: {seg['text'][:60]}"
+            )
+            translated_text, _ = _google_translate_single(seg['text'], dest='zh-cn')
+            if translated_text:
+                logger.info(f"  └ Google 翻译成功: {seg['text'][:40]} → {translated_text[:40]}")
+            else:
+                logger.warning(f"  └ Google 翻译也失败，降级使用原文: {seg['text'][:60]}")
+                translated_text = seg['text']
+        results.append({**seg, "translated_text": translated_text})
+    return results
+
+
 def _translate_segments_llm(fused_results, target_lang="zh", config=None, prompt_template=None):
     """
-    使用 LLM 进行翻译。
-    优化策略：
-    1. 术语一致性（参考术语表）
-    2. 上下文连贯性（传递前文作为参考）
-    3. 口语化表达（适合视频字幕）
-    4. 长度控制（避免过长句子）
-    5. 文化适配（本地化表达）
+    使用 LLM 进行翻译（滑窗重叠 + 上下文连贯）。
+    
+    核心优化：
+    1. 上下文来自已翻译的中文结果（而非英文原文），确保语义连贯
+    2. 批次间有重叠窗口，每个片段在两次不同上下文中被翻译，取第二次（更多参考）
+    3. 上下文窗口扩展到 6 条，覆盖约 30 秒的前文内容
+    4. 术语一致性、口语化表达、长度控制
     """
     if not fused_results:
         return []
 
     logger.info(f"开始 LLM 翻译任务 -> {target_lang}...")
 
-    # 从配置读取 API Key
     api_key = config.get('api_key') if config else None
     if not api_key or "your-openai-api-key" in api_key:
         logger.warning("未配置有效的 API Key，返回占位翻译。")
         return [{**seg, "translated_text": f"[FIXME] {seg['text']}"} for seg in fused_results]
 
-    model_name = config.get('model', 'deepseek-ai/DeepSeek-V3')
+    stage_cfg = config.get('translator', {}) if config else {}
+    model_name = stage_cfg.get('model', config.get('model', 'deepseek-ai/DeepSeek-V3'))
     base_url = config.get('api_base', 'https://api.siliconflow.cn/v1')
-    temperature = config.get('temperature', 0.1)
-    client = OpenAI(api_key=api_key, base_url=base_url, timeout=120.0)
+    temperature = stage_cfg.get('temperature', config.get('temperature', 0.1))
+    request_timeout = stage_cfg.get('request_timeout', config.get('default_request_timeout', 120))
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=max(request_timeout + 30, 120.0))
 
-    # 加载术语表（全量，批次内按需过滤）
     terminology = _load_terminology(config)
     full_term_str = "无"
     if terminology:
         full_term_str = ";".join(f"{k}={v}" for k, v in terminology.items())
     
-    translated_results = []
+    translated_results = []  # 已确认的翻译结果（中文），也是上下文来源
     
-    # 控制批次大小：太大容易超出 max_tokens 导致末尾截断，太小浪费 API 调用
-    # 从配置读取，默认 20（平衡质量和效率）
     batch_size = config.get('batch_size', 20) if config else 20
+    overlap = max(2, batch_size // 8)  # 每批末尾重叠 2~3 条，在下一批重译
+    context_window = stage_cfg.get('context_window', config.get('translate_context_window', 8))
     total_batches = (len(fused_results) + batch_size - 1) // batch_size
     completed_batches = 0
-    last_evolved_batch = 0  # 追踪上次进化的批次号
-    evolve_every = 12  # 每 N 批进行一次中期术语进化（合理频率，避免过度消耗）
-    evolve_disabled = False  # 收敛后停止进化，节省 token
+    last_evolved_batch = 0
+    evolve_every = 12
+    evolve_disabled = False
     
-    # 粘性降级：主模型限流后切换到备用，后续批次直接用备用，定期试探主模型
     fallback_model = config.get('fallback_model') if config else None
     current_model = model_name
     model_sticky = False
-    sticky_check_interval = 8  # 每 8 批试探一次主模型
+    sticky_check_interval = config.get('sticky_check_interval', 8) if config else 8
     
-    logger.info(f"总共 {len(fused_results)} 个片段，分 {total_batches} 批处理（每批 {batch_size} 个）")
+    logger.info(
+        f"总共 {len(fused_results)} 个片段，{total_batches} 批（每批 {batch_size} 条，"
+        f"重叠 {overlap} 条，上下文窗口 {context_window} 条）"
+    )
     
-    for i in range(0, len(fused_results), batch_size):
-        batch_num = i // batch_size + 1
-        batch = fused_results[i:i+batch_size]
+    i = 0  # 当前批次在 fused_results 中的起始索引
+    while i < len(fused_results):
+        batch_num = (i // batch_size) + 1
+        batch_display_num = (i // batch_size) + 1
         
-        # 全局过载检测：已确认主模型不可用，直接切备用
+        # 动态计算本批重叠量（最后一批可能没有足够数据做重叠）
+        actual_overlap = overlap if i + batch_size + overlap <= len(fused_results) else 0
+        batch_end = min(i + batch_size + actual_overlap, len(fused_results))
+        batch = fused_results[i:batch_end]
+        commit_count = min(batch_size, len(batch) - actual_overlap) if actual_overlap > 0 else len(batch)
+        
+        # 全局过载检测
         if not model_sticky and is_model_overloaded() and fallback_model:
             logger.info(f"  检测到主模型全局过载，直接使用备用模型: {fallback_model.split('/')[-1]}")
             current_model = fallback_model
             model_sticky = True
         
-        # 粘性降级：定期试探主模型
-        if model_sticky and fallback_model and batch_num % sticky_check_interval == 0:
+        if model_sticky and fallback_model and batch_display_num % sticky_check_interval == 0:
             logger.info(f"  试探主模型 {model_name.split('/')[-1]} 是否恢复...")
             current_model = model_name
         elif model_sticky and fallback_model:
             current_model = fallback_model
         
-        # 显示当前批次进度
-        logger.info(f"正在翻译批次 {batch_num}/{total_batches} (片段 {i+1}-{min(i+len(batch), len(fused_results))})...")
+        logger.info(
+            f"正在翻译批次 {batch_display_num}/{total_batches} "
+            f"(原文片段 {i+1}-{batch_end}，提交前 {commit_count} 条)..."
+        )
         
-        # 构造批量翻译提示词
+        # ── 构造批量翻译提示词 ──
         texts_to_translate = "\n".join([f"{j+1}: {seg['text']}" for j, seg in enumerate(batch)])
-        
-        # 按需过滤：只发送当前批内出现的术语，大幅节省 token
         batch_term_str = _filter_terms_by_text(terminology, [seg['text'] for seg in batch]) if terminology else "无"
         
-        # 提取前文作为上下文参考（最近 3 个片段）— 空则跳过，不发送"无"
-        context_start = max(0, i - 3)
-        context_segments = fused_results[context_start:i]
+        # ── 上下文：从已翻译结果取最近 context_window 条（原文→译文对照）──
         context_text = ""
         context_block = ""
-        if context_segments:
-            context_text = "\n".join([f"{idx+1}: {seg.get('translated_text', seg['text'])}" 
-                                     for idx, seg in enumerate(context_segments)])
-            context_block = f"\n**上下文参考**（前文翻译，保持连贯性）：\n{context_text}"
+        if translated_results:
+            ctx_start = max(0, len(translated_results) - context_window)
+            ctx_segs = translated_results[ctx_start:]
+            context_lines = []
+            for idx, seg in enumerate(ctx_segs):
+                src = seg.get('text', '')
+                zh = seg.get('translated_text', '')
+                if src and zh and src != zh:
+                    # 原文→译文对照：让模型理解翻译风格
+                    context_lines.append(f"{idx+1}: {src}  →  {zh}")
+                elif zh:
+                    context_lines.append(f"{idx+1}: {zh}")
+            if context_lines:
+                context_text = "\n".join(context_lines)
+                context_block = (
+                    f"**前文参考**（原文→译文对照，保持术语一致、语气连贯）：\n"
+                    f"{context_text}"
+                )
         
         if prompt_template:
-            # 安全格式化：只替换模板中实际存在的占位符
             try:
                 prompt = prompt_template.replace('{target_lang}', target_lang)
                 prompt = prompt.replace('{text}', texts_to_translate)
                 prompt = prompt.replace('{terminology}', batch_term_str)
-                prompt = prompt.replace('{context}', context_text)
+                prompt = prompt.replace('{context}', context_block)
                 prompt = prompt.replace('{count}', str(len(batch)))
             except Exception:
                 prompt = (
@@ -242,20 +313,19 @@ def _translate_segments_llm(fused_results, target_lang="zh", config=None, prompt
             )
         
         # ── 带重试 + 模型降级 + 粘性的 API 调用 ──
-        max_retries = 3
-        base_delay = 3  # 初始等待秒数
+        max_retries = stage_cfg.get('max_retries', 3)
+        base_delay = config.get('retry_base_delay', 3) if config else 3
         translated_this_batch = False
+        temp_map = {}
 
         for attempt in range(max_retries):
-            # 第 2 次失败后切换备用模型，并启用粘性
             if attempt >= 2 and fallback_model and current_model != fallback_model:
                 logger.info(f"  └ 主模型 {current_model} 持续限流，切换到备用模型: {fallback_model}")
                 current_model = fallback_model
-                model_sticky = True  # 后续批次直接用备用模型
+                model_sticky = True
 
             try:
                 wait_for_llm_api()
-                # 动态 max_tokens：输入字符数 × 3（中文输出 token 开销大），最少 3000
                 input_chars = sum(len(seg['text']) for seg in batch)
                 dynamic_max_tokens = max(3000, int(input_chars * 3))
                 response = client.chat.completions.create(
@@ -263,97 +333,46 @@ def _translate_segments_llm(fused_results, target_lang="zh", config=None, prompt
                     messages=[{"role": "user", "content": prompt}],
                     temperature=temperature,
                     max_tokens=dynamic_max_tokens,
-                    timeout=120
+                    timeout=request_timeout
                 )
 
                 content = response.choices[0].message.content.strip()
-                lines = [line.strip() for line in content.split('\n') if line.strip()]
-
-                # 建立一个临时字典保存翻译结果，防止行号错乱
-                temp_map = {}
-                for line in lines:
-                    # 尝试匹配 "数字: 内容" 或 "数字：内容"
-                    match = re.match(r'^(\d+)\s*[:：]\s*(.*)$', line)
-                    if match:
-                        idx = int(match.group(1)) - 1  # 1-based to 0-based
-                        cleaned = _clean_llm_line(match.group(2).strip())
-                        if cleaned:  # 清洗后有实质内容才录入
-                            temp_map[idx] = cleaned
-                    elif ":" in line:
-                        try:
-                            idx_str, content_part = line.split(":", 1)
-                            idx = int(re.sub(r'\D', '', idx_str)) - 1
-                            cleaned = _clean_llm_line(content_part.strip())
-                            if cleaned:
-                                temp_map[idx] = cleaned
-                        except: pass
-
-                for j, seg in enumerate(batch):
-                    # 优先从 map 取
-                    translated_text = temp_map.get(j)
-
-                    # 如果 map 中没有，尝试按顺序取 (仅当行数正好匹配时)
-                    if not translated_text and len(lines) == len(batch):
-                        # 再次尝试从当前行提取内容，即使它不符合 "数字: 内容" 格式
-                        curr_line = lines[j]
-                        if ":" in curr_line:
-                             _, translated_text = curr_line.split(":", 1)
-                             translated_text = translated_text.strip()
-                        else:
-                             translated_text = curr_line
-
-                    if not translated_text:
-                        # 第一层兜底：LLM 遗漏 → 尝试 Google 翻译
-                        logger.warning(
-                            f"翻译批次 {batch_num}/{total_batches} 片段 {j+1} 译文缺失，"
-                            f"尝试 Google 翻译: {seg['text'][:60]}"
-                        )
-                        translated_text, _ = _google_translate_single(seg['text'], dest='zh-cn')
-                        if translated_text:
-                            logger.info(f"  └ Google 翻译成功: {seg['text'][:40]} → {translated_text[:40]}")
-                        else:
-                            # 第二层兜底：Google 也失败，用原文（最后手段）
-                            logger.warning(
-                                f"  └ Google 翻译也失败，降级使用原文: {seg['text'][:60]}"
-                            )
-                            translated_text = seg['text']
-                    # 创建新 dict 副本，避免污染 fused_results 原始数据
-                    translated_results.append({
-                        **seg, "translated_text": translated_text
-                    })
-
+                temp_map = _parse_llm_translation_response(content, len(batch))
                 translated_this_batch = True
-                break  # 成功后跳出重试循环
+                break
 
             except Exception as e:
                 err_msg = str(e).lower()
-                # 检测致命错误（余额不足、key 无效等），立即终止程序
+                err_str = str(e)
                 if any(kw in err_msg for kw in ('balance', 'insufficient', 'invalid', 'unauthorized', '403', '401')):
-                    logger.error(f"翻译批次 {batch_num}/{total_batches} API 错误: {e}")
+                    logger.error(f"翻译批次 {batch_display_num}/{total_batches} API 错误: {e}")
                     raise RuntimeError(
                         f"翻译 API 致命错误（余额不足/Key无效），已处理 {completed_batches}/{total_batches} 批。"
                         f"请检查 API Key 和账户余额后重试。"
                     ) from e
 
-                # 429 限流 / 服务繁忙 → 通知全局过载检测器
-                is_rate_limit = '429' in str(e) or 'rate' in err_msg or 'too busy' in err_msg
+                is_rate_limit = '429' in err_str or 'rate' in err_msg or 'too busy' in err_msg
+                is_server_error = any(f'{code}' in err_str for code in range(500, 600))
+                is_timeout_err = 'timeout' in err_msg or 'timed out' in err_msg
+                is_retryable = is_rate_limit or is_server_error or is_timeout_err
+
                 if is_rate_limit:
                     mark_model_overloaded()
-                if is_rate_limit and attempt < max_retries - 1:
-                    delay = (base_delay ** (attempt + 1)) * (0.5 + random.random())  # 加抖动: 3±1.5s, 9±4.5s...
+                if is_retryable and attempt < max_retries - 1:
+                    delay = (base_delay ** (attempt + 1)) * (0.5 + random.random())
                     model_label = current_model.split('/')[-1]
-                    logger.warning(f"翻译限流 [{model_label}]，{delay:.1f}s 后重试 ({attempt + 1}/{max_retries})...")
+                    reason = "限流" if is_rate_limit else ("超时" if is_timeout_err else f"服务端错误({err_str[:80]})")
+                    logger.warning(f"翻译{reason} [{model_label}]，{delay:.1f}s 后重试 ({attempt + 1}/{max_retries})...")
                     time.sleep(delay)
                     continue
 
-                # 非限流错误，或重试次数耗尽
-                logger.error(f"批量翻译失败 (批次 {batch_num}/{total_batches}): {e}")
+                logger.error(f"批量翻译失败 (批次 {batch_display_num}/{total_batches}): {e}")
                 break
 
-        # ── 如果重试耗尽仍未成功，用 Google 翻译逐条兜底 ──
+        # ── 提交本批结果 ──
         if not translated_this_batch:
             logger.warning(
-                f"翻译批次 {batch_num}/{total_batches} LLM 失败（{max_retries} 次重试耗尽），"
+                f"翻译批次 {batch_display_num}/{total_batches} LLM 失败（{max_retries} 次重试耗尽），"
                 f"使用 Google 翻译兜底 {len(batch)} 个片段"
             )
             for j, seg in enumerate(batch):
@@ -362,29 +381,30 @@ def _translate_segments_llm(fused_results, target_lang="zh", config=None, prompt
                     translated_results.append({**seg, "translated_text": gt})
                     logger.info(f"  └ Google 兜底 [{j+1}/{len(batch)}]: {seg['text'][:40]} → {gt[:40]}")
                 else:
-                    logger.warning(
-                        f"  └ Google 兜底也失败 [{j+1}/{len(batch)}]，使用原文: {seg['text'][:60]}"
-                    )
+                    logger.warning(f"  └ Google 兜底也失败 [{j+1}/{len(batch)}]，使用原文: {seg['text'][:60]}")
                     translated_results.append({**seg, "translated_text": seg['text']})
             completed_batches += 1
             progress_pct = (completed_batches / total_batches * 100) if total_batches > 0 else 0
-            logger.info(f"批次 {batch_num}/{total_batches} 完成（Google 兜底）({progress_pct:.1f}%)")
+            logger.info(f"批次 {batch_display_num}/{total_batches} 完成（Google 兜底）({progress_pct:.1f}%)")
         else:
-            # 更新批次完成进度
+            # 仅提交前 commit_count 条，剩余的 overlap 交由下一批重译
+            batch_results = _commit_translated_segments(
+                batch, temp_map, commit_count, batch_display_num, total_batches
+            )
+            translated_results.extend(batch_results)
             completed_batches += 1
             progress_pct = (completed_batches / total_batches * 100) if total_batches > 0 else 0
-            logger.info(f"批次 {batch_num}/{total_batches} 完成 ({progress_pct:.1f}%)")
+            logger.info(f"批次 {batch_display_num}/{total_batches} 完成 ({progress_pct:.1f}%)")
         
-        # ── 中期术语表进化（每 evolve_every 批触发一次，收敛后自动停止）──
+        # ── 中期术语表进化 ──
         if (not evolve_disabled and config and config.get('api_key') 
                 and config.get('terminology_file') and translated_results 
-                and batch_num % evolve_every == 0 and batch_num != last_evolved_batch):
+                and batch_display_num % evolve_every == 0 and batch_display_num != last_evolved_batch):
             try:
                 prev_count = len(terminology) if terminology else 0
-                logger.info(f"  └ 触发术语表中途进化（第 {batch_num}/{total_batches} 批）")
+                logger.info(f"  └ 触发术语表中途进化（第 {batch_display_num}/{total_batches} 批）")
                 result = evolve_terminology(translated_results, config=config)
-                last_evolved_batch = batch_num
-                # 立即重新加载术语表并更新缓存
+                last_evolved_batch = batch_display_num
                 reloaded = _load_terminology(config)
                 new_count = len(reloaded) if reloaded else 0
                 if new_count != prev_count:
@@ -394,14 +414,16 @@ def _translate_segments_llm(fused_results, target_lang="zh", config=None, prompt
                     full_term_str = ";".join(f"{k}={v}" for k, v in terminology.items())
                 else:
                     full_term_str = "无"
-                # 收敛检测：术语表已较丰富且本轮无新增，停止后续进化
                 if new_count > 5 and new_count == prev_count:
                     evolve_disabled = True
                     logger.info(f"  └ 术语表已收敛（{new_count} 条），停止后续进化")
             except Exception as e:
                 logger.warning(f"  └ 中期术语进化跳过（不影响主流程）: {e}")
+        
+        # 前进 batch_size（而非 batch_size+overlap），重叠部分下批重译
+        i += batch_size
 
-    # ── 最终术语表进化（仅在未收敛且最后一轮未触发中期进化时执行）──
+    # ── 最终术语表进化 ──
     if (not evolve_disabled and config and config.get('api_key') 
             and config.get('terminology_file') and translated_results 
             and last_evolved_batch < total_batches):
@@ -415,6 +437,28 @@ def _translate_segments_llm(fused_results, target_lang="zh", config=None, prompt
                 logger.info(f"术语表最终更新: {prev_count} → {new_count} 条")
         except Exception as e:
             logger.warning(f"最终术语进化跳过（不影响主流程）: {e}")
+
+    # ── 翻译质量校验：检测并修复漏翻/空翻译 ──
+    untranslated = 0
+    fixed_count = 0
+    for seg in translated_results:
+        src_text = (seg.get('text') or '').strip()
+        tr_text = (seg.get('translated_text') or '').strip()
+        if not tr_text or tr_text == src_text:
+            untranslated += 1
+            # 自动尝试 Google 翻译兜底
+            gt, _ = _google_translate_single(src_text, dest='zh-cn')
+            if gt and gt != src_text:
+                seg['translated_text'] = gt
+                fixed_count += 1
+    if untranslated > 0:
+        if fixed_count > 0:
+            logger.info(f"翻译质量校验: Google 兜底修复 {fixed_count}/{untranslated} 条空/漏翻译")
+        if untranslated > fixed_count:
+            logger.warning(
+                f"翻译质量校验: {untranslated - fixed_count} 条片段仍无有效翻译，"
+                f"请检查原文或人工修正"
+            )
 
     logger.success(f"LLM 翻译完成，共 {len(translated_results)} 段")
     return translated_results
@@ -520,9 +564,11 @@ def evolve_terminology(translated_results, config=None, prompt_template=None):
         logger.info("未指定术语表文件路径，跳过术语进化")
         return {}
     
-    model_name = config.get('model', 'deepseek-ai/DeepSeek-V3')
+    stage_cfg = config.get('translator', {}) if config else {}
+    model_name = stage_cfg.get('model', config.get('model', 'deepseek-ai/DeepSeek-V3'))
     base_url = config.get('api_base', 'https://api.siliconflow.cn/v1')
-    client = OpenAI(api_key=api_key, base_url=base_url, timeout=120.0)
+    request_timeout = stage_cfg.get('request_timeout', config.get('default_request_timeout', 120))
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=max(request_timeout + 30, 120.0))
     
     # 加载现有术语表
     existing_terms = _load_terminology(config)
@@ -559,7 +605,7 @@ def evolve_terminology(translated_results, config=None, prompt_template=None):
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
             max_tokens=1200,
-            timeout=120
+            timeout=request_timeout
         )
         content = response.choices[0].message.content.strip()
         
@@ -683,9 +729,11 @@ def evolve_prompt(prompt_path, samples, step_name, config=None):
         logger.warning(f"提示词进化 [{step_name}]：当前文件为空，跳过")
         return False
 
-    model_name = config.get('model', 'deepseek-ai/DeepSeek-V3')
+    stage_cfg = config.get('translator', {}) if config else {}
+    model_name = stage_cfg.get('model', config.get('model', 'deepseek-ai/DeepSeek-V3'))
     base_url = config.get('api_base', 'https://api.siliconflow.cn/v1')
-    client = OpenAI(api_key=api_key, base_url=base_url, timeout=120.0)
+    request_timeout = stage_cfg.get('request_timeout', config.get('default_request_timeout', 120))
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=max(request_timeout + 30, 120.0))
 
     # 去重后最多取 15 个样本
     seen = set()
@@ -732,7 +780,7 @@ def evolve_prompt(prompt_path, samples, step_name, config=None):
             messages=[{"role": "user", "content": evolution_prompt}],
             temperature=0.25,
             max_tokens=1500,
-            timeout=120
+            timeout=request_timeout
         )
         optimized = response.choices[0].message.content.strip()
 

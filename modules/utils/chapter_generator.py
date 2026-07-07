@@ -17,9 +17,11 @@ def generate_chapters(srt_content, config=None, prompt_template=None):
         logger.warning("未配置有效的 API Key，跳过章节生成。")
         return ""
 
-    model_name = config.get('model', 'gpt-4o') if config else 'gpt-4o'
-    base_url = config.get('api_base', 'https://api.openai.com/v1') if config else 'https://api.openai.com/v1'
-    client = OpenAI(api_key=api_key, base_url=base_url)
+    stage_cfg = config.get('chapter_generator', {}) if config else {}
+    model_name = stage_cfg.get('model', config.get('model', 'deepseek-ai/DeepSeek-V3')) if config else 'deepseek-ai/DeepSeek-V3'
+    base_url = config.get('api_base', 'https://api.siliconflow.cn/v1') if config else 'https://api.siliconflow.cn/v1'
+    timeout = stage_cfg.get('request_timeout', config.get('default_request_timeout', 120)) if config else 120
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=max(timeout + 30, 120.0))
 
     if prompt_template:
         prompt = prompt_template.format(srt_text=srt_content[:10000])

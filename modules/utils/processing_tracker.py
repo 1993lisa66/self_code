@@ -209,15 +209,23 @@ class ProcessingTracker:
                 }
             self._ensure_steps_init(vf, mode)
 
-    def mark_step_done(self, video_path, step_name, output_name=None):
-        """标记步骤完成。"""
+    def mark_step_done(self, video_path, step_name, output_name=None, duration_seconds=None):
+        """标记步骤完成。
+
+        Args:
+            duration_seconds: 该步骤执行耗时（秒），可选。传入后自动更新文件总耗时。
+        """
         entry = self._get_entry(video_path)
         if output_name:
             entry["output_name"] = output_name
-        entry["steps"][step_name] = {
+        step_record = {
             "status": "done",
             "at": datetime.now().isoformat(),
         }
+        if duration_seconds is not None:
+            step_record["duration_seconds"] = duration_seconds
+        entry["steps"][step_name] = step_record
+        self._update_total_duration(entry)
 
     def mark_step_failed(self, video_path, step_name, message=""):
         """标记步骤失败。"""
@@ -235,6 +243,15 @@ class ProcessingTracker:
             "status": "skipped",
             "reason": reason,
         }
+
+    def _update_total_duration(self, entry):
+        """汇总所有已完成步骤的耗时，写入 entry['total_duration_seconds']。"""
+        total = 0.0
+        for step_info in entry.get("steps", {}).values():
+            dur = step_info.get("duration_seconds")
+            if isinstance(dur, (int, float)):
+                total += dur
+        entry["total_duration_seconds"] = round(total, 2)
 
     def get_step_status(self, video_path, step_name):
         """获取步骤状态字符串。"""

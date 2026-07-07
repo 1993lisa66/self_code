@@ -1,13 +1,8 @@
 asr:
   device: cpu
-  model_id: iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch
   # ASR 识别语言：auto（自动检测）| en（强制英文）| zh（强制中文）| ja 等
   language: auto
   model_size: base
-  terminology_file: config/terminology.json
-  voting_models:
-  - whisperx
-  - glm
 audio:
   channels: 1
   normalize: true
@@ -17,16 +12,58 @@ global:
   max_concurrency:
     # 本地计算（音频提取、VAD、ASR、FFmpeg）多进程并行
     # LLM / TTS 等远程 API 调用已通过文件锁串行化，不会触发限速
-    video_processor: 6
+    video_processor: 1
 llm:
   api_base: https://api.siliconflow.cn/v1
   api_key: sk-pyxmrlxwmhgcvztkwmudjoyyypnbvwbkoctfixqqhcojeufg
-  # 主模型限流时自动降级的备用模型（更轻量，容量更充足）
-  fallback_model: Qwen/Qwen2.5-7B-Instruct
+  model: deepseek-ai/DeepSeek-V3
+  fallback_model: deepseek-ai/DeepSeek-V3
+  default_request_timeout: 120
+  retry_base_delay: 3
+  sticky_check_interval: 8
+
+  # ── 各阶段独立模型配置 ──
+  # ASR 融合修正
+  asr_fixer:
+    model: deepseek-ai/DeepSeek-V3
+    temperature: 0.1
+    max_tokens: 8000
+    request_timeout: 120
+
+  # 语义重切分
+  resegmenter:
+    model: deepseek-ai/DeepSeek-V3
+    temperature: 0.1
+    max_tokens: 4096
+    max_retries: 1
+    request_timeout: 120
+    batch_size: 20
+    overlap: 2
+    circuit_breaker_windows: 3
+    auto_skip_threshold: 0.70
+    skip: false
+
+  # 翻译
+  translator:
+    model: deepseek-ai/DeepSeek-V3
+    temperature: 0.1
+    max_retries: 3
+    request_timeout: 120
+    context_window: 8
+
+  # TTS 文本预处理
+  tts_processor:
+    model: deepseek-ai/DeepSeek-V3
+    temperature: 0.1
+    batch_size: 5
+    max_retries: 3
+
+  # 章节生成
   chapter_generator:
     model: deepseek-ai/DeepSeek-V3
     temperature: 0.1
-  model: deepseek-ai/DeepSeek-V3
+    request_timeout: 120
+
   prompts:
     asr_fix: asr_fix.txt
     chapters: chapters.txt
@@ -34,22 +71,10 @@ llm:
     semantic_segmentation: semantic_segmentation.txt
     translation: translation.txt
     tts_prep: tts_prep.txt
-  translator:
-    max_retries: 3
-    model: deepseek-ai/DeepSeek-V3
-    temperature: 0.1
-  tts_processor:
-    model: deepseek-ai/DeepSeek-V3
-    temperature: 0.1
-    # TTS 预处理每批条目数，太大容易导致模型截断返回
-    batch_size: 5
 paths:
-  assets_dir: assets
   batches_dir: config/batches
   cache_dir: cache
-  input_dir: input
   log_dir: logs
-  models_dir: models
   output_dir: outputs
   prompts_dir: config/prompts
   terminology_file: config/terminology.json
@@ -60,14 +85,12 @@ translate:
   # 翻译引擎: llm（大模型翻译，质量高但需 API Key）| google（免费快速，质量中等）
   provider: llm
   # Google 翻译请求间隔（秒），越小越快但可能被封
-  google_delay: 0.3
+  google_delay: 0.5
   # LLM 翻译每批处理的片段数（默认 20），太大容易超出 token 限制导致末尾截断
   batch_size: 15
 tts:
   # TTS 引擎: edge（微软免费在线语音合成）
   provider: edge
-  speed_limit: 1.5
-
   # ── Edge TTS（微软免费在线语音合成）─────────────────────────
   edge:
     # 中文语音: zh-CN-YunyangNeural, zh-CN-XiaoxiaoNeural, zh-CN-YunxiNeural
@@ -90,7 +113,4 @@ whisperx:
   batch_size: 16
   compute_type: float16
   device: cpu
-  diarization: true
-  max_speakers: 10
-  min_speakers: 1
   model: base

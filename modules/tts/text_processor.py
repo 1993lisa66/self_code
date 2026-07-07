@@ -47,11 +47,13 @@ def _text_hash(text):
 def _make_client(config):
     """创建 OpenAI 客户端"""
     api_key = config.get('api_key') if config else None
-    base_url = config.get('api_base', 'https://api.openai.com/v1') if config else 'https://api.openai.com/v1'
-    model_name = config.get('model', 'gpt-4o') if config else 'gpt-4o'
+    base_url = config.get('api_base', 'https://api.siliconflow.cn/v1') if config else 'https://api.siliconflow.cn/v1'
+    stage_cfg = config.get('tts_processor', {}) if config else {}
+    model_name = stage_cfg.get('model', config.get('model', 'deepseek-ai/DeepSeek-V3')) if config else 'deepseek-ai/DeepSeek-V3'
     if not api_key or "your-openai-api-key" in api_key:
         return None, None
-    client = OpenAI(api_key=api_key, base_url=base_url)
+    timeout = stage_cfg.get('request_timeout', config.get('default_request_timeout', 120)) if config else 120
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=max(timeout + 30, 120.0))
     return client, model_name
 
 
@@ -189,8 +191,8 @@ def process_tts_text_batch(texts, config=None, prompt_template=None, batch_size=
         else:
             prompt = _default_batch_prompt(numbered, len(batch_texts))
 
-        max_retries = 3
-        base_delay = 3
+        max_retries = config.get('tts_processor', {}).get('max_retries', 3) if config else 3
+        base_delay = config.get('retry_base_delay', 3) if config else 3
         batch_ok = False
 
         for attempt in range(max_retries):
@@ -243,12 +245,17 @@ def process_tts_text_batch(texts, config=None, prompt_template=None, batch_size=
 
             except Exception as e:
                 err_msg = str(e).lower()
-                is_rate_limit = '429' in str(e) or 'rate' in err_msg or 'too busy' in err_msg
+                err_str = str(e)
+                is_rate_limit = '429' in err_str or 'rate' in err_msg or 'too busy' in err_msg
+                is_server_error = any(f'{code}' in err_str for code in range(500, 600))
+                is_retryable = is_rate_limit or is_server_error
 
-                if is_rate_limit and attempt < max_retries - 1:
-                    mark_model_overloaded()
+                if is_retryable and attempt < max_retries - 1:
+                    if is_rate_limit:
+                        mark_model_overloaded()
                     delay = (base_delay ** (attempt + 1)) * (0.5 + random.random())
-                    logger.warning(f"TTS 预处理限流，{delay:.1f}s 后重试 ({attempt + 1}/{max_retries})...")
+                    reason = "限流" if is_rate_limit else f"服务端错误({err_str[:80]})"
+                    logger.warning(f"TTS 预处理{reason}，{delay:.1f}s 后重试 ({attempt + 1}/{max_retries})...")
                     time.sleep(delay)
                     continue
 

@@ -16,7 +16,6 @@ from loguru import logger
 from .prompt_helper import (
     load_prompt_template, get_project_root
 )
-from ..utils.api_lock import api_lock, tts_lock
 
 
 def _get_lazy_import(name, import_fn):
@@ -122,7 +121,9 @@ def vad_only(video_path, cache_dir, config):
     vad_output_dir = os.path.join(cache_dir, "vad")
     segments = _import_run_vad()(
         audio_path, output_dir=vad_output_dir,
-        device=config['asr']['device']
+        device=config['asr']['device'],
+        min_silence_duration_ms=config.get('vad', {}).get('min_silence_duration_ms', 500),
+        min_speech_duration_ms=config.get('vad', {}).get('min_speech_duration_ms', 250)
     )
     logger.success(f"VAD 完成，检测到 {len(segments)} 个语音片段")
     return {'segments': segments}
@@ -247,13 +248,17 @@ def translation_only(video_path, cache_dir, config):
         dict: {'translated_results': [...], 'source_is_chinese': bool}，失败返回 None
     """
     import json as _json
+    from ..llm.resegmentation import semantic_resegment
+
     translated_cache_path = os.path.join(cache_dir, "translated_results.json")
-    if os.path.exists(translated_cache_path):
+    fused_cache_path = os.path.join(cache_dir, "fused_results.json")
+    resegmented_cache_path = os.path.join(cache_dir, "resegmented_results.json")
+
+    # ── 缓存命中路径 ──
+    if os.path.exists(translated_cache_path) and os.path.exists(resegmented_cache_path):
         with open(translated_cache_path, 'r', encoding='utf-8') as f:
             translated = _json.load(f)
-        # 从 fused_results 缓存推算 source_is_chinese（确保缓存命中时返回值正确）
         from ..subtitle.srt_utils import is_chinese_text
-        fused_cache_path = os.path.join(cache_dir, "fused_results.json")
         source_is_chinese = False
         if os.path.exists(fused_cache_path):
             with open(fused_cache_path, 'r', encoding='utf-8') as ff:
@@ -264,7 +269,7 @@ def translation_only(video_path, cache_dir, config):
         logger.info(f"📦 命中翻译缓存，共 {len(translated)} 条片段")
         return {'translated_results': translated, 'source_is_chinese': source_is_chinese}
 
-    fused_cache_path = os.path.join(cache_dir, "fused_results.json")
+    # ── 加载 fused_results ──
     if not os.path.exists(fused_cache_path):
         logger.error(f"LLM 修正缓存不存在: {fused_cache_path}")
         return None
@@ -275,6 +280,24 @@ def translation_only(video_path, cache_dir, config):
     source_is_chinese = is_chinese_text(
         [{'text': seg.get('text', '')} for seg in fused_results]
     )
+
+    # ── 语义重切分：合并 VAD 断句碎片为完整句子（仅非中文源）──
+    if not source_is_chinese and not os.path.exists(resegmented_cache_path):
+        logger.info("[重切分] 合并断开片段为完整句子...")
+        fused_results = semantic_resegment(fused_results, config=config.get('llm', {}))
+        with open(resegmented_cache_path, 'w', encoding='utf-8') as rf:
+            _json.dump(fused_results, rf, ensure_ascii=False, indent=2)
+        with open(fused_cache_path, 'w', encoding='utf-8') as ff:
+            _json.dump(fused_results, ff, ensure_ascii=False, indent=2)
+        logger.success(f"语义重切分完成，片段数 → {len(fused_results)} 条")
+        # 清空旧翻译缓存（片段数已变化）
+        if os.path.exists(translated_cache_path):
+            with open(translated_cache_path, 'w', encoding='utf-8') as tf:
+                _json.dump([], tf)
+    elif os.path.exists(resegmented_cache_path):
+        # 已有重切分缓存，直接用
+        with open(resegmented_cache_path, 'r', encoding='utf-8') as rf:
+            fused_results = _json.load(rf)
 
     logger.info("[Phase-1/5] 翻译字幕（→ 中文）...")
     translated_results = translation_stage(
@@ -289,22 +312,27 @@ def translation_only(video_path, cache_dir, config):
 
 
 def srt_only(video_path, cache_dir, config, target_output_dir):
-    """只生成 SRT 字幕并复制视频（Phase-1/6），从缓存读取所有结果。
+    """只生成 SRT 字幕（Phase-1/6），从缓存读取所有结果。
 
     Returns:
         dict: {'srt_path': ..., 'source_is_chinese': ..., 'output_base_name': ...}
     """
     import json as _json
-    import shutil
 
     fused_cache_path = os.path.join(cache_dir, "fused_results.json")
     translated_cache_path = os.path.join(cache_dir, "translated_results.json")
+    resegmented_cache_path = os.path.join(cache_dir, "resegmented_results.json")
 
     if not os.path.exists(fused_cache_path):
         logger.error(f"LLM 修正缓存不存在: {fused_cache_path}")
         return None
-    with open(fused_cache_path, 'r', encoding='utf-8') as f:
-        fused_results = _json.load(f)
+    # 优先使用语义重切分后的结果（与翻译对齐，时间边界一致）
+    if os.path.exists(resegmented_cache_path):
+        with open(resegmented_cache_path, 'r', encoding='utf-8') as f:
+            fused_results = _json.load(f)
+    else:
+        with open(fused_cache_path, 'r', encoding='utf-8') as f:
+            fused_results = _json.load(f)
 
     if not os.path.exists(translated_cache_path):
         logger.error(f"翻译缓存不存在: {translated_cache_path}")
@@ -332,16 +360,6 @@ def srt_only(video_path, cache_dir, config, target_output_dir):
         source_is_chinese=source_is_chinese
     )
     logger.success(f"SRT 字幕生成完成: {srt_path}")
-
-    # 复制视频到输出目录（供阶段二使用）
-    original_ext = os.path.splitext(video_path)[1]
-    copied_video = os.path.join(target_output_dir, f"{output_base_name}{original_ext}")
-    if not os.path.exists(copied_video):
-        shutil.copy2(video_path, copied_video)
-        logger.info(f"📁 视频已复制到输出目录: {copied_video}")
-    else:
-        logger.info(f"📁 视频已存在于输出目录，跳过复制: {copied_video}")
-
     return {
         'srt_path': srt_path, 'source_is_chinese': source_is_chinese,
         'output_base_name': output_base_name
@@ -351,7 +369,7 @@ def srt_only(video_path, cache_dir, config, target_output_dir):
 # ── 阶段二子步骤（供 video_cli.py 批量编排使用）──
 
 
-def tts_prep_only(video_path, cache_dir, config):
+def tts_prep_only(video_path, cache_dir, config, target_output_dir=None):
     """阶段二 Step 1：SRT 解析 + TTS 文本预处理。缓存命中时自动跳过。
 
     Returns:
@@ -368,8 +386,48 @@ def tts_prep_only(video_path, cache_dir, config):
 
     logger.info("[Phase-2/1] SRT 解析 + TTS 文本预处理...")
 
+    from pathlib import Path as _Path
     from ..subtitle.srt_utils import find_srt_file, parse_srt_to_segments
-    srt_path = find_srt_file(video_path, lang='zh')
+    from ..utils.filename_translator import translate_filename as _translate_filename
+
+    original_base_name = _Path(video_path).stem
+
+    # 在输出目录中查找 .zh.srt 文件（按优先级：翻译名 > 原始名 > 同编号前缀）
+    srt_path = None
+    if target_output_dir:
+        # 1) 优先用翻译后的文件名（与 srt_only 成功翻译时一致）
+        output_base_name = _translate_filename(original_base_name, config.get('llm', {}))
+        candidate = os.path.join(target_output_dir, f"{output_base_name}.zh.srt")
+        if os.path.exists(candidate):
+            srt_path = candidate
+            logger.info(f"  在输出目录找到字幕: {srt_path}")
+
+    if not srt_path and target_output_dir:
+        # 2) 回退：原始文件名（翻译失败或缓存不一致时）
+        candidate_orig = os.path.join(target_output_dir, f"{original_base_name}.zh.srt")
+        if os.path.exists(candidate_orig):
+            srt_path = candidate_orig
+            logger.info(f"  在输出目录找到字幕(原始名): {srt_path}")
+
+    if not srt_path and target_output_dir:
+        # 3) 模糊匹配：同编号前缀的任一 .zh.srt（处理文件名被部分修改的极端情况）
+        import re as _re
+        prefix_match = _re.match(r'^(\d+\s*[-._]\s*)', original_base_name)
+        if prefix_match:
+            prefix = prefix_match.group(0)
+            try:
+                for fname in os.listdir(target_output_dir):
+                    if fname.startswith(prefix) and fname.endswith('.zh.srt'):
+                        srt_path = os.path.join(target_output_dir, fname)
+                        logger.info(f"  在输出目录找到字幕(前缀匹配): {srt_path}")
+                        break
+            except OSError:
+                pass
+
+    # 回退：在视频所在目录查找
+    if not srt_path:
+        srt_path = find_srt_file(video_path, lang='zh')
+
     if not srt_path:
         logger.error("未找到中文字幕文件（SRT）")
         return None
@@ -392,12 +450,16 @@ def tts_prep_only(video_path, cache_dir, config):
     prompts_dir = config['paths'].get('prompts_dir', os.path.join(get_project_root(), 'config', 'prompts'))
     prompt_template = load_prompt_template(prompts_dir, 'tts_prep.txt')
     llm_config = dict(config.get('llm', {}))
+    # 合并 translate 子配置（batch_size 等关键参数）
+    translate_cfg = config.get('translate', {})
+    for k in ('batch_size', 'max_tokens', 'temperature'):
+        if k in translate_cfg:
+            llm_config.setdefault(k, translate_cfg[k])
 
     tts_texts = [seg['text'] for seg in segments]
-    with api_lock:
-        processed = _import_process_tts_text_batch()(
-            tts_texts, config=llm_config, prompt_template=prompt_template
-        )
+    processed = _import_process_tts_text_batch()(
+        tts_texts, config=llm_config, prompt_template=prompt_template
+    )
 
     for idx, tts_text in enumerate(processed):
         segments[idx]["tts_text"] = tts_text
@@ -485,10 +547,9 @@ def tts_generate_only(video_path, cache_dir, config):
         segments = _json.load(f)
 
     logger.info("[Phase-2/2] 生成 TTS 语音...")
-    with tts_lock:
-        tts_audio = asyncio.run(_import_generate_tts()(
-            segments, output_dir=tts_output_dir, config=config['tts']
-        ))
+    tts_audio = asyncio.run(_import_generate_tts()(
+        segments, output_dir=tts_output_dir, config=config['tts']
+    ))
 
     logger.success(f"TTS 语音生成完成: {tts_audio}")
     return {'tts_audio': tts_audio}
@@ -584,13 +645,17 @@ def llm_fix_stage(asr_results, config):
         logger.info(f"  加载提示词模板: asr_fix.txt")
 
     llm_config = dict(config.get('llm', {}))
+    # 合并 translate 子配置（batch_size 等关键参数）
+    translate_cfg = config.get('translate', {})
+    for k in ('batch_size', 'max_tokens', 'temperature'):
+        if k in translate_cfg:
+            llm_config.setdefault(k, translate_cfg[k])
 
     try:
-        with api_lock:
-            logger.info("  🔒 已获取 API 锁，开始 LLM 修正...")
-            fused_results = _import_fuse_asr()(
-                asr_results, config=llm_config, prompt_template=prompt_template
-            )
+        logger.info("  开始 LLM 修正...")
+        fused_results = _import_fuse_asr()(
+            asr_results, config=llm_config, prompt_template=prompt_template
+        )
         logger.success(f"LLM 修正完成")
         return fused_results
     except Exception as e:
@@ -616,12 +681,16 @@ def translation_stage(fused_results, config, source_is_chinese=False):
     prompt_template = load_prompt_template(prompts_dir, 'translation.txt')
 
     llm_config = dict(config.get('llm', {}))
+    # 合并 translate 子配置（batch_size 等关键参数）
+    translate_cfg = config.get('translate', {})
+    for k in ('batch_size', 'max_tokens', 'temperature'):
+        if k in translate_cfg:
+            llm_config.setdefault(k, translate_cfg[k])
 
-    with api_lock:
-        logger.info("  🔒 已获取 API 锁，开始翻译...")
-        translated_results = _import_translate()(
-            fused_results, target_lang='zh', config=llm_config, prompt_template=prompt_template
-        )
+    logger.info("  开始翻译...")
+    translated_results = _import_translate()(
+        fused_results, target_lang='zh', config=llm_config, prompt_template=prompt_template
+    )
 
     logger.success(f"翻译完成")
     return translated_results
@@ -639,13 +708,17 @@ def tts_stage(translated_results, cache_dir, config):
     prompts_dir = config['paths'].get('prompts_dir', os.path.join(get_project_root(), 'config', 'prompts'))
     prompt_template = load_prompt_template(prompts_dir, 'tts_prep.txt')
     llm_config = dict(config.get('llm', {}))
+    # 合并 translate 子配置（batch_size 等关键参数）
+    translate_cfg = config.get('translate', {})
+    for k in ('batch_size', 'max_tokens', 'temperature'):
+        if k in translate_cfg:
+            llm_config.setdefault(k, translate_cfg[k])
 
     tts_texts = [seg.get("translated_text", seg["text"]) for seg in translated_results]
-    with api_lock:
-        logger.info("  🔒 已获取 API 锁，开始 TTS 文本预处理...")
-        processed = _import_process_tts_text_batch()(
-            tts_texts, config=llm_config, prompt_template=prompt_template
-        )
+    logger.info("  开始 TTS 文本预处理...")
+    processed = _import_process_tts_text_batch()(
+        tts_texts, config=llm_config, prompt_template=prompt_template
+    )
     for idx, tts_text in enumerate(processed):
         translated_results[idx]["tts_text"] = tts_text
     logger.success(f"TTS 文本预处理完成")
@@ -653,11 +726,9 @@ def tts_stage(translated_results, cache_dir, config):
     # 生成 TTS 音频
     logger.info("生成 TTS 配音...")
     tts_output_dir = os.path.join(cache_dir, "tts")
-    with tts_lock:
-        logger.info("  🔒 已获取 TTS 锁，开始 TTS 语音合成...")
-        tts_audio = asyncio.run(_import_generate_tts()(
-            translated_results, output_dir=tts_output_dir, config=config['tts']
-        ))
+    tts_audio = asyncio.run(_import_generate_tts()(
+        translated_results, output_dir=tts_output_dir, config=config['tts']
+    ))
     logger.success(f"TTS 配音生成完成: {tts_audio}")
     return tts_audio
 

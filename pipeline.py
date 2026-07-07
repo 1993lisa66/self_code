@@ -19,6 +19,71 @@ from modules.merge.merge_video import merge_video
 from modules.utils.chapter_generator import generate_chapters
 import re
 
+def merge_incomplete_sentences(segments):
+    """
+    翻译前预处理：合并明显不完整的句子片段。
+    
+    WhisperX 常因声学停顿将一句话切为多段（如 "This candle..."
+    "reveals what the market..." "is really doing"）。在翻译前先做
+    启发式合并，避免 LLM 看到碎片化输入。
+    
+    合并规则：
+    1. 当前段不以 .!? 结尾 → 与下一段合并
+    2. 当前段 < 15 个字符（过短，大概率是不完整从句）→ 与下一段合并
+    3. 下一段以小写字母开头 → 延续上一句
+    
+    保留原始分段索引映射，供后续回溯使用。
+    """
+    if not segments:
+        return []
+    
+    merged = []
+    i = 0
+    merge_count = 0
+    
+    while i < len(segments):
+        seg = dict(segments[i])  # 浅拷贝
+        text = seg.get('text', '').strip()
+        
+        # 判断当前段是否需要与下一段合并
+        while i + 1 < len(segments):
+            next_seg = segments[i + 1]
+            next_text = next_seg.get('text', '').strip()
+            
+            # 条件1：当前段不以结束标点结尾
+            ends_with_punct = text.endswith(('.', '!', '?'))
+            # 条件2：当前段过短
+            is_too_short = len(text) < 15
+            # 条件3：下一段以小写开头（延续上一句）且当前段没结束
+            next_starts_lower = next_text and next_text[0].islower() if next_text else False
+            
+            should_merge = (not ends_with_punct) or is_too_short
+            # 额外保护：如果当前段已经很长且以标点结尾，即使用小写开头也不合并
+            # （可能是专有名词或格式问题）
+            if ends_with_punct and len(text) > 30:
+                should_merge = False
+            
+            if should_merge:
+                seg['text'] = text + ' ' + next_text
+                seg['end'] = next_seg['end']
+                seg['_merged_from'] = (seg.get('_merged_from', [i]) + [i + 1])
+                text = seg['text']
+                i += 1
+                merge_count += 1
+            else:
+                break
+        
+        merged.append(seg)
+        i += 1
+    
+    if merge_count > 0:
+        logger.info(
+            f"  翻译前句子合并: {merge_count} 条碎片合并，"
+            f"段数 {len(segments)} → {len(merged)}"
+        )
+    return merged
+
+
 def split_into_subtitles(translated_results):
     """
     将长句子进一步拆分为多个短字幕，使屏幕显示更易读。
@@ -187,7 +252,9 @@ class VideoTranslationPipeline:
             segments = run_vad(
                 audio_path,
                 output_dir=os.path.join(target_cache_dir, "vad"),
-                device=self.config['asr']['device']
+                device=self.config['asr']['device'],
+                min_silence_duration_ms=self.config.get('vad', {}).get('min_silence_duration_ms', 500),
+                min_speech_duration_ms=self.config.get('vad', {}).get('min_speech_duration_ms', 250)
             )
             final_result_data["steps"]["vad"] = {"count": len(segments), "segments": segments}
             
@@ -233,6 +300,8 @@ class VideoTranslationPipeline:
             
             # STEP 5: 翻译
             logger.info("STEP 5: 翻译")
+            # ── 翻译前合并破碎句子（WhisperX 声学切分 → 语义合并）──
+            merged_for_translation = merge_incomplete_sentences(resegmented_results)
             # 合并翻译引擎配置（provider: llm/google）
             translate_cfg = self.config.get('translate', {})
             merged_config = dict(self.config.get('llm', {}))
@@ -240,7 +309,7 @@ class VideoTranslationPipeline:
                 merged_config['provider'] = translate_cfg.get('provider', 'llm')
                 merged_config['google_delay'] = translate_cfg.get('google_delay', 0.3)
             translated_results = translate_segments(
-                resegmented_results, 
+                merged_for_translation, 
                 target_lang=self.config['translate']['target_language'],
                 config=merged_config,
                 prompt_template=self.prompts.get('translation')

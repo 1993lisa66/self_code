@@ -7,6 +7,7 @@
 
 import os
 import shutil
+import time
 from pathlib import Path
 from loguru import logger
 
@@ -17,6 +18,7 @@ from .stages import (
     llm_fix_only, translation_only, srt_only,
     tts_prep_only, tts_generate_only, merge_only,
 )
+from ..llm.resegmentation import semantic_resegment
 from .tts_from_srt import process_tts_from_srt
 from ..subtitle.srt_utils import (
     find_srt_file, parse_srt_to_segments, generate_all_srt_files, is_chinese_text,
@@ -135,6 +137,7 @@ def process_video_unified(video_path, config, mode='tts_no_subtitle',
     _cached_translated = None
     fused_cache_path = os.path.join(cache_dir, "fused_results.json")
     translated_cache_path = os.path.join(cache_dir, "translated_results.json")
+    resegmented_cache_path = os.path.join(cache_dir, "resegmented_results.json")
 
     if os.path.exists(fused_cache_path):
         import json as _json
@@ -168,6 +171,23 @@ def process_video_unified(video_path, config, mode='tts_no_subtitle',
             )
             if _source_is_chinese:
                 logger.info("🔍 检测到缓存中 ASR 输出已是中文（源语言为中文），将跳过翻译")
+            # 语义重切分：合并碎片为完整句
+            if os.path.exists(resegmented_cache_path):
+                # 已有重切分缓存 → 用它替换 fused_results（确保与翻译片段数一致）
+                import json as _json
+                with open(resegmented_cache_path, 'r', encoding='utf-8') as _rf:
+                    fused_results = _json.load(_rf)
+            elif not _source_is_chinese:
+                logger.info("🔄 缓存数据未经过语义重切分，正在合并碎片句子...")
+                fused_results = semantic_resegment(fused_results, config=config.get('llm', {}))
+                translated_results = None  # 片段数变了，旧翻译失效，需重新翻译
+                import json as _json
+                with open(resegmented_cache_path, 'w', encoding='utf-8') as _rf:
+                    _json.dump(fused_results, _rf, ensure_ascii=False, indent=2)
+                with open(fused_cache_path, 'w', encoding='utf-8') as _ff:
+                    _json.dump(fused_results, _ff, ensure_ascii=False, indent=2)
+                with open(translated_cache_path, 'w', encoding='utf-8') as _tf:
+                    _json.dump([], _tf)  # 清空旧翻译缓存，强制重新翻译
             logger.success(f"从缓存恢复完成，共 {len(fused_results)} 条片段")
         else:
             # ── Phase 1: ASR（或使用已有字幕） ──
@@ -216,6 +236,15 @@ def process_video_unified(video_path, config, mode='tts_no_subtitle',
                 if _source_is_chinese:
                     logger.info("🔍 检测到 ASR 输出已是中文（源语言为中文），将跳过翻译")
 
+            # ── 语义重切分：合并 VAD 断句碎片为完整句子 ──
+            if not _source_is_chinese and not _existing_srt_is_chinese:
+                logger.info("\n[重切分] 合并断开片段为完整句子...")
+                fused_results = semantic_resegment(fused_results, config=config.get('llm', {}))
+                import json as _json
+                with open(resegmented_cache_path, 'w', encoding='utf-8') as _rf:
+                    _json.dump(fused_results, _rf, ensure_ascii=False, indent=2)
+                logger.success(f"语义重切分完成，片段数 → {len(fused_results)} 条")
+
             # ── Phase 3: 翻译 ──
             translated_results = None
 
@@ -238,6 +267,21 @@ def process_video_unified(video_path, config, mode='tts_no_subtitle',
         srt_path = None
         tts_audio = None
         final_video = None
+
+        # ── 翻译兜底：重切分后旧翻译缓存被清空，需重新翻译 ──
+        if translated_results is None and mode in ['tts_no_subtitle', 'tts_with_review']:
+            logger.info("\n[STEP 5/6] 重新翻译（语义重切分后片段数变化）...")
+            if not _source_is_chinese:
+                _source_is_chinese = is_chinese_text(
+                    [{'text': seg.get('text', '')} for seg in fused_results]
+                )
+            translated_results = translation_stage(
+                fused_results, config,
+                source_is_chinese=_source_is_chinese
+            )
+            import json as _json
+            with open(translated_cache_path, 'w', encoding='utf-8') as _f:
+                _json.dump(translated_results, _f, ensure_ascii=False, indent=2)
 
         # ── Phase 4: 生成 SRT 文件 ──
         if mode in ['tts_no_subtitle', 'tts_with_review']:
@@ -334,10 +378,18 @@ def process_substep(video_path, config, substep, input_dir='', output_dir='',
     base_name = Path(video_path).stem
 
     # 计算缓存目录（与 process_video_unified 保持一致）
+    # 注意：USE_OUTPUT_VIDEO 步骤的 input_dir 会被设为 output_dir，
+    # 此时 video_path（原始路径）不在 input_dir 下，直接使用 output_dir。
     if input_dir and os.path.isdir(input_dir):
-        rel_path = os.path.relpath(video_path, input_dir)
-        rel_dir = os.path.dirname(rel_path)
-        target_output_dir = os.path.join(output_dir, rel_dir)
+        try:
+            rel_path = os.path.relpath(video_path, input_dir)
+        except ValueError:
+            rel_path = None
+        if rel_path is not None and not rel_path.startswith('..'):
+            rel_dir = os.path.dirname(rel_path)
+            target_output_dir = os.path.join(output_dir, rel_dir)
+        else:
+            target_output_dir = output_dir
     else:
         target_output_dir = output_dir
 
@@ -356,7 +408,7 @@ def process_substep(video_path, config, substep, input_dir='', output_dir='',
         '_srt': ('生成 SRT 字幕',
                  lambda: srt_only(video_path, cache_dir, config, target_output_dir)),
         '_tts_prep': ('SRT解析+TTS预处理',
-                      lambda: tts_prep_only(video_path, cache_dir, config)),
+                      lambda: tts_prep_only(video_path, cache_dir, config, target_output_dir)),
         '_tts_generate': ('TTS 语音合成',
                           lambda: tts_generate_only(video_path, cache_dir, config)),
         '_merge': ('合并视频+对齐SRT',
@@ -372,98 +424,100 @@ def process_substep(video_path, config, substep, input_dir='', output_dir='',
 
     try:
         logger.info(f"  [{label}] {base_name}")
+        t_start = time.time()
         result = fn()
+        elapsed = round(time.time() - t_start, 2)
 
         if substep == '_extract_audio':
             return {
                 'video_path': video_path, 'status': 'success',
-                'message': '音频提取完成', 'output_name': base_name
+                'message': '音频提取完成', 'output_name': base_name, 'elapsed': elapsed
             }
         elif substep == '_vad':
             segs = result.get('segments', [])
             if not segs:
                 return {
                     'video_path': video_path, 'status': 'failed',
-                    'message': '未检测到语音片段', 'output_name': base_name
+                    'message': '未检测到语音片段', 'output_name': base_name, 'elapsed': elapsed
                 }
             return {
                 'video_path': video_path, 'status': 'success',
-                'message': f'VAD 完成，{len(segs)} 个片段', 'output_name': base_name
+                'message': f'VAD 完成，{len(segs)} 个片段', 'output_name': base_name, 'elapsed': elapsed
             }
         elif substep == '_asr':
             if result is None:
                 return {
                     'video_path': video_path, 'status': 'failed',
-                    'message': 'ASR 识别结果为空', 'output_name': base_name
+                    'message': 'ASR 识别结果为空', 'output_name': base_name, 'elapsed': elapsed
                 }
             return {
                 'video_path': video_path, 'status': 'success',
-                'message': f'ASR 完成，{len(result)} 个片段', 'output_name': base_name
+                'message': f'ASR 完成，{len(result)} 个片段', 'output_name': base_name, 'elapsed': elapsed
             }
         elif substep == '_llm_fix':
             if result is None:
                 return {
                     'video_path': video_path, 'status': 'failed',
-                    'message': 'LLM 修正失败', 'output_name': base_name
+                    'message': 'LLM 修正失败', 'output_name': base_name, 'elapsed': elapsed
                 }
             fused_segs = result.get('fused_results', [])
             return {
                 'video_path': video_path, 'status': 'success',
-                'message': f'LLM 修正完成，{len(fused_segs)} 个片段', 'output_name': base_name
+                'message': f'LLM 修正完成，{len(fused_segs)} 个片段', 'output_name': base_name, 'elapsed': elapsed
             }
         elif substep == '_translation':
             if result is None:
                 return {
                     'video_path': video_path, 'status': 'failed',
-                    'message': '翻译失败（LLM修正缓存不存在）', 'output_name': base_name
+                    'message': '翻译失败（LLM修正缓存不存在）', 'output_name': base_name, 'elapsed': elapsed
                 }
             translated_segs = result.get('translated_results', [])
             # 翻译完成后确定输出文件名，记录到 processing_state.json 保证一致性
             output_base_name = translate_filename(base_name, config.get('llm', {}))
             return {
                 'video_path': video_path, 'status': 'success',
-                'message': f'翻译完成，{len(translated_segs)} 条', 'output_name': output_base_name
+                'message': f'翻译完成，{len(translated_segs)} 条', 'output_name': output_base_name, 'elapsed': elapsed
             }
         elif substep == '_srt':
             if result is None:
                 return {
                     'video_path': video_path, 'status': 'failed',
-                    'message': 'SRT 生成失败（缓存缺失）', 'output_name': base_name
+                    'message': 'SRT 生成失败（缓存缺失）', 'output_name': base_name, 'elapsed': elapsed
                 }
             output_base_name = translate_filename(base_name, config.get('llm', {}))
             return {
                 'video_path': video_path, 'status': 'success',
                 'message': 'SRT 字幕生成完成',
                 'output_name': output_base_name,
-                'srt_path': result.get('srt_path')
+                'srt_path': result.get('srt_path'), 'elapsed': elapsed
             }
         elif substep == '_tts_prep':
             if result is None:
                 return {
                     'video_path': video_path, 'status': 'failed',
-                    'message': 'SRT 解析或 TTS 预处理失败', 'output_name': base_name
+                    'message': 'SRT 解析或 TTS 预处理失败', 'output_name': base_name, 'elapsed': elapsed
                 }
             segs = result.get('segments', [])
             return {
                 'video_path': video_path, 'status': 'success',
-                'message': f'TTS 预处理完成，{len(segs)} 条', 'output_name': base_name
+                'message': f'TTS 预处理完成，{len(segs)} 条', 'output_name': base_name, 'elapsed': elapsed
             }
         elif substep == '_tts_generate':
             if result is None:
                 return {
                     'video_path': video_path, 'status': 'failed',
-                    'message': 'TTS 语音合成失败', 'output_name': base_name
+                    'message': 'TTS 语音合成失败', 'output_name': base_name, 'elapsed': elapsed
                 }
             return {
                 'video_path': video_path, 'status': 'success',
                 'message': 'TTS 语音合成完成', 'output_name': base_name,
-                'tts_audio': result.get('tts_audio')
+                'tts_audio': result.get('tts_audio'), 'elapsed': elapsed
             }
         elif substep == '_merge':
             if result is None:
                 return {
                     'video_path': video_path, 'status': 'failed',
-                    'message': '合并视频失败', 'output_name': base_name
+                    'message': '合并视频失败', 'output_name': base_name, 'elapsed': elapsed
                 }
             output_base_name = translate_filename(base_name, config.get('llm', {}))
             return {
@@ -471,7 +525,7 @@ def process_substep(video_path, config, substep, input_dir='', output_dir='',
                 'message': '合并视频完成',
                 'output_name': output_base_name,
                 'final_video': result.get('final_video'),
-                'srt_path': result.get('srt_path')
+                'srt_path': result.get('srt_path'), 'elapsed': elapsed
             }
     except Exception as e:
         logger.error(f"分步处理 [{substep}] {base_name} 出错: {e}")
@@ -479,5 +533,5 @@ def process_substep(video_path, config, substep, input_dir='', output_dir='',
         logger.error(traceback.format_exc())
         return {
             'video_path': video_path, 'status': 'failed',
-            'message': str(e), 'output_name': base_name
+            'message': str(e), 'output_name': base_name, 'elapsed': 0.0
         }

@@ -14,7 +14,6 @@ from loguru import logger
 from .prompt_helper import get_project_root, load_prompt_template
 from ..subtitle.srt_utils import find_srt_file, parse_srt_to_segments
 from ..subtitle.generate_srt import generate_srt
-from ..utils.api_lock import api_lock, tts_lock
 
 
 def process_tts_from_srt(video_path, base_name, cache_dir, target_output_dir,
@@ -69,11 +68,10 @@ def process_tts_from_srt(video_path, base_name, cache_dir, target_output_dir,
 
         # 惰性导入 TTS 模块
         from ..tts.text_processor import process_tts_text_batch
-        with api_lock:
-            logger.info("  🔒 已获取 API 锁，开始 TTS 文本预处理...")
-            processed = process_tts_text_batch(
-                tts_texts, config=llm_config, prompt_template=prompt_template
-            )
+        logger.info("  开始 TTS 文本预处理...")
+        processed = process_tts_text_batch(
+            tts_texts, config=llm_config, prompt_template=prompt_template
+        )
         for idx, tts_text in enumerate(processed):
             segments[idx]["tts_text"] = tts_text
             segments[idx]["translated_text"] = tts_text  # 兼容 TTS 模块
@@ -84,11 +82,10 @@ def process_tts_from_srt(video_path, base_name, cache_dir, target_output_dir,
         logger.info("\n[STEP 3/4] 生成 TTS 中文配音...")
         tts_output_dir = os.path.join(cache_dir, "tts")
         from ..tts.tts_pipeline import generate_tts
-        with tts_lock:
-            logger.info("  🔒 已获取 TTS 锁，开始 TTS 语音合成...")
-            tts_audio = asyncio.run(generate_tts(
-                segments, output_dir=tts_output_dir, config=config['tts']
-            ))
+        logger.info("  开始 TTS 语音合成...")
+        tts_audio = asyncio.run(generate_tts(
+            segments, output_dir=tts_output_dir, config=config['tts']
+        ))
         logger.success(f"TTS 配音生成完成: {tts_audio}")
 
         # Step 4: 合并音频到视频

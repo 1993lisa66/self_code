@@ -314,14 +314,22 @@ def _consolidate_caches(output_dir: str):
 
 def _review_prompt(video_files: list[str], input_dir: str,
                    output_dir: str, config: dict, tracker: ProcessingTracker):
-    """tts_with_review：srt 完成后打印审核提示。"""
+    """tts_with_review：srt 完成后复制视频到输出目录并打印审核提示。"""
+    import shutil
     llm_cfg = config.get('llm', {})
     print(f"\n{SEP}\n📝 SRT 字幕已生成，请人工审核：")
     for vf in video_files:
         out_name = tracker.get_output_name(vf) or translate_filename(Path(vf).stem, llm_cfg)
-        srt = os.path.join(target_dir(vf, input_dir, output_dir), f"{out_name}.zh.srt")
+        tgt_dir = target_dir(vf, input_dir, output_dir)
+        srt = os.path.join(tgt_dir, f"{out_name}.zh.srt")
         if os.path.exists(srt):
             print(f"   📄 {srt}")
+        # 复制视频到输出目录（审核模式下视频和 SRT 放一起方便人工核对）
+        original_ext = os.path.splitext(vf)[1]
+        copied_video = os.path.join(tgt_dir, f"{out_name}{original_ext}")
+        if not os.path.exists(copied_video):
+            shutil.copy2(vf, copied_video)
+            logger.info(f"📁 视频已复制到输出目录: {copied_video}")
     print(f"\n   审核完成后重新运行脚本，自动继续 TTS 配音合成。\n{SEP}\n")
     logger.info("⏸️  等待人工审核")
 
@@ -411,7 +419,8 @@ def main(input_path: str = DEFAULT_INPUT, output_dir: str = DEFAULT_OUTPUT,
         for r in results:
             orig = v2orig.get(r['video_path'], r['video_path'])
             match r['status']:
-                case 'success':  tracker.mark_step_done(orig, step, output_name=r.get('output_name'))
+                case 'success':  tracker.mark_step_done(orig, step, output_name=r.get('output_name'),
+                                                        duration_seconds=r.get('elapsed'))
                 case 'failed':   tracker.mark_step_failed(orig, step, message=r.get('message', ''))
                 case 'skipped':  tracker.mark_step_skipped(orig, step, reason=r.get('message', ''))
         tracker.save()

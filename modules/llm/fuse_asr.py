@@ -34,9 +34,11 @@ def fuse_asr_result(multi_asr_results, config=None, prompt_template=None):
         logger.warning("未配置有效的 API Key，跳过融合，默认使用 WhisperX 结果。")
         return multi_asr_results["whisperx"]
 
-    model_name = config.get('model', 'deepseek-ai/DeepSeek-V3')
+    stage_cfg = config.get('asr_fixer', {}) if config else {}
+    model_name = stage_cfg.get('model', config.get('model', 'deepseek-ai/DeepSeek-V3'))
     base_url = config.get('api_base', 'https://api.siliconflow.cn/v1')
-    client = OpenAI(api_key=api_key, base_url=base_url, timeout=120.0)
+    request_timeout = stage_cfg.get('request_timeout', config.get('default_request_timeout', 120))
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=max(request_timeout + 30, 120.0))
 
     whisper_segs = multi_asr_results["whisperx"]
 
@@ -113,7 +115,7 @@ def fuse_asr_result(multi_asr_results, config=None, prompt_template=None):
         fallback_model = config.get('fallback_model') if config else None
         current_model = model_name
         model_sticky = False  # 粘性降级：一旦切到备用模型就保持，每 N 批试探主模型是否恢复
-        sticky_check_interval = 8  # 每 8 批检测一次主模型是否恢复
+        sticky_check_interval = config.get('sticky_check_interval', 8) if config else 8
         
         for i in range(0, len(whisper_segs), batch_size):
             batch_num = i // batch_size + 1
@@ -182,7 +184,7 @@ def fuse_asr_result(multi_asr_results, config=None, prompt_template=None):
                     messages=[{"role": "user", "content": sub_prompt}],
                     temperature=0.1,
                     max_tokens=dynamic_max_tokens,
-                    timeout=120
+                    timeout=request_timeout
                 )
                 content = response.choices[0].message.content.strip()
                 lines = [l.strip() for l in content.split('\n') if l.strip()]

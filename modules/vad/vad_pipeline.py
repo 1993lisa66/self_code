@@ -3,7 +3,8 @@ import json
 from loguru import logger
 from faster_whisper import WhisperModel
 
-def run_vad(audio_path, output_dir="cache/vad", device="cuda", model_size="large-v3"):
+def run_vad(audio_path, output_dir="cache/vad", device="cuda", model_size="large-v3",
+            min_silence_duration_ms=500, min_speech_duration_ms=250):
     """
     使用 Faster-Whisper 的 VAD 功能进行语音切片
     """
@@ -32,7 +33,8 @@ def run_vad(audio_path, output_dir="cache/vad", device="cuda", model_size="large
         segments, info = model.transcribe(
             audio_path, 
             vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500)
+            vad_parameters=dict(min_silence_duration_ms=min_silence_duration_ms,
+                                    min_speech_duration_ms=min_speech_duration_ms)
         )
         
         results = []
