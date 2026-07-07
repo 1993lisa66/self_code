@@ -5,9 +5,9 @@ from yt_dlp import YoutubeDL
 
 # ====================== 默认配置 ======================
 # 不传参数时使用的默认值，可直接修改这里
-DEFAULT_URL = "https://www.youtube.com/watch?v=r8bgiWo7ef8&t=52s"
+DEFAULT_URL = "https://www.youtube.com/watch?v=t8JhvEbifR8"
 DEFAULT_OUTPUT = "/Volumes/mvp/[00]交易场/edgeskool"
-DEFAULT_QUALITY = "1080p"  # 360p / 480p / 720p / 1080p / 1440p / 2160p
+DEFAULT_QUALITY = "2160p"  # 360p / 480p / 720p / 1080p / 1440p / 2160p
 COOKIE_FILE = "www.youtube.com_cookies.txt"
 # ====================================================
 

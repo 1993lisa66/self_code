@@ -76,8 +76,8 @@ def clear_overload():
 
 
 # 全局速率限制器实例
-# LLM API: 默认每分钟最多10次调用（根据 SiliconFlow 免费配额调整）
-llm_rate_limiter = RateLimiter(max_calls=10, time_window=60.0)
+# LLM API: 默认每分钟最多60次调用（SiliconFlow DeepSeek-V3 实际额度远高于此）
+llm_rate_limiter = RateLimiter(max_calls=60, time_window=60.0)
 
 # TTS API: 默认每分钟最多30次调用（Edge TTS 限制较宽松）
 tts_rate_limiter = RateLimiter(max_calls=30, time_window=60.0)

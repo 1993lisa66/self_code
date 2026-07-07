@@ -39,16 +39,30 @@ def fuse_asr_result(multi_asr_results, config=None, prompt_template=None):
     client = OpenAI(api_key=api_key, base_url=base_url, timeout=120.0)
 
     whisper_segs = multi_asr_results["whisperx"]
+
+    # 读取第二模型（GLM/SenseVoice）结果，用于投票对比
+    glm_segs = multi_asr_results.get("glm", [])
+    # 清洗 SenseVoice 标签：<|en|> <|NEUTRAL|> <|Speech|> <|withitn|> 等
+    _tag_re = re.compile(r'<\|[^|]*\|>')
+    for g in glm_segs:
+        g["text"] = _tag_re.sub('', g.get("text", "")).strip()
+    has_second_model = bool(glm_segs) and len(glm_segs) == len(whisper_segs)
+    if has_second_model:
+        logger.info(f"检测到第二模型结果（{len(glm_segs)} 条），将启用双模型投票融合")
+    else:
+        if glm_segs:
+            logger.warning(f"第二模型结果数量不匹配（glm:{len(glm_segs)} vs whisperx:{len(whisper_segs)}），仅单模型修正")
+        else:
+            logger.info("未检测到第二模型结果，仅对 WhisperX 结果进行 LLM 修正")
     
-    # 工业级：分批处理，每批 30 个片段
-    batch_size = 30
+    # 控制批次：太大容易超出 max_tokens 导致幻觉/截断（输出假"示例"文本）
+    batch_size = config.get('batch_size', 15) if config else 15
     final_results = [None] * len(whisper_segs)  # 预分配空间保持顺序
     total_batches = (len(whisper_segs) + batch_size - 1) // batch_size
-    completed_batches = 0
     
     logger.info(f"总共 {len(whisper_segs)} 个片段，分 {total_batches} 批处理（每批 {batch_size} 个）")
     
-    # 在循环外加载术语表一次（术语表不变，没必要每批重新读取）
+    # 在循环外加载术语表一次，批内按需过滤
     terminology = {}
     term_file = config.get('terminology_file', 'terminology.json') if config else 'terminology.json'
     if os.path.exists(term_file):
@@ -63,16 +77,36 @@ def fuse_asr_result(multi_asr_results, config=None, prompt_template=None):
                         terminology = json.load(f)
                 except:
                     pass
-    term_str = json.dumps(terminology, ensure_ascii=False) if terminology else "无特殊术语"
     
-    # 内置默认 prompt 模板（精简版）
-    _default_prompt_tpl = (
-        "合并多个ASR结果，选最优并修正：\n"
-        f"术语表：{term_str}\n"
-        "修正标点、大小写、去冗余词(um/uh/you know)、恢复英文标准拼写。\n\n"
-        "格式：\"数字: 文本\" 每行一条，共{{count}}行，不解释。\n\n"
-        "{{text}}"
+    # 内置默认 prompt 模板（双模型投票 / 单模型修正）
+    _default_prompt_tpl = {
+        False: (
+            # 单模型：仅修正
+            "请修正以下英文ASR识别结果，修正标点、大小写、去语气词、恢复英文标准拼写：\n"
+            "{term_line}"
+            "格式：\"数字: 文本\" 每行一条，共{{count}}行，不解释。\n\n"
+            "{{text}}"
+        ),
+        True: (
+            # 双模型：投票融合
+            "以下有两组ASR识别结果（模型A和模型B），请对比两组结果投票选出最优文本，"
+            "合并修正标点、大小写、去语气词、恢复英文标准拼写：\n"
+            "{term_line}"
+            "格式：\"数字: 文本\" 每行一条，共{{count}}行，不解释。\n\n"
+            "{{text}}"
+        ),
+    }
+
+    # ── LLM 响应中常见的无效注释模式 ──
+    _NOTE_PATTERN = re.compile(
+        r'[\(\[（]\s*(?:Note|注|说明|注意|提示|Note\s*that)[：:].*?[\)\]）]',
+        re.IGNORECASE | re.DOTALL,
     )
+
+    def _clean_fuse_line(text: str) -> str:
+        """清洗 LLM 返回行中的注释/碎碎念，返回空字符串表示该行应丢弃。"""
+        return _NOTE_PATTERN.sub('', text).strip()
+
     
     try:
         llm_disabled = False  # 一旦遇到余额不足等致命错误，跳过后续所有批次
@@ -107,118 +141,151 @@ def fuse_asr_result(multi_asr_results, config=None, prompt_template=None):
 
             logger.info(f"正在融合 ASR 片段批次: {batch_num}/{total_batches} (片段 {i+1}-{min(i+len(batch), len(whisper_segs))})...")
             
-            combined_context = ""
-            for j, seg in enumerate(batch):
-                global_idx = i + j
-                parts = [f"[{j+1}] W: {seg['text']}"]
-                for m in ["glm"]:
-                    if m in multi_asr_results and global_idx < len(multi_asr_results[m]):
-                        parts.append(f"G: {multi_asr_results[m][global_idx]['text']}")
-                combined_context += " | ".join(parts) + "\n"
+            # ── 内部函数：尝试融合一批（单次 API 调用） ──
+            def _try_fuse_one(batch_segs, glm_batch_texts=None):
+                """返回 (parsed_map, is_hallucination) 或抛出异常"""
+                wait_for_llm_api()
+                # 动态构建 prompt（术语按需过滤）
+                sub_texts = [seg['text'] for seg in batch_segs]
+                sub_term_line = ""
+                if terminology:
+                    ct = " ".join(sub_texts).lower()
+                    rel = {k: v for k, v in terminology.items() if k.lower() in ct}
+                    if rel:
+                        sub_term_line = f"术语表：{';'.join(f'{k}={v}' for k,v in rel.items())}\n"
 
-            # 使用外部提示词模板（如果提供），否则使用内置默认模板
-            if prompt_template:
+                # 构建输入文本：单模型或双模型对比
+                if glm_batch_texts and len(glm_batch_texts) == len(batch_segs):
+                    lines = []
+                    for k in range(len(sub_texts)):
+                        lines.append(f"{k+1}: A[{sub_texts[k]}] B[{glm_batch_texts[k]}]")
+                    combined = "\n".join(lines)
+                else:
+                    combined = "\n".join(f"{k+1}:{t}" for k, t in enumerate(sub_texts))
+
+                use_dual = bool(glm_batch_texts and len(glm_batch_texts) == len(batch_segs))
+                tpl = _default_prompt_tpl.get(use_dual, _default_prompt_tpl[False])
+                if prompt_template:
+                    try:
+                        sub_prompt = prompt_template.format(text=combined, count=len(batch_segs))
+                    except KeyError:
+                        sub_prompt = tpl.format(
+                            term_line=sub_term_line, text=combined, count=len(batch_segs))
+                else:
+                    sub_prompt = tpl.format(
+                        term_line=sub_term_line, text=combined, count=len(batch_segs))
+
+                input_chars = sum(len(t) for t in sub_texts)
+                dynamic_max_tokens = max(3000, int(input_chars * 2.5))
+                response = client.chat.completions.create(
+                    model=current_model,
+                    messages=[{"role": "user", "content": sub_prompt}],
+                    temperature=0.1,
+                    max_tokens=dynamic_max_tokens,
+                    timeout=120
+                )
+                content = response.choices[0].message.content.strip()
+                lines = [l.strip() for l in content.split('\n') if l.strip()]
+
+                # 幻觉检测
+                _hallucination_kw = ['修正文本示例', '修正示例', '示例文本', '输出示例', '输出格式',
+                                    'incomplete', 'provide full context', 'needs more context']
+                if len(lines) <= len(batch_segs) and any(kw in content.lower() for kw in _hallucination_kw):
+                    return None, True  # is_hallucination
+
+                # 解析结果
+                parsed = {}
+                for line in lines:
+                    m = re.match(r'^(\d+)\s*[:：]\s*(.*)$', line)
+                    if m:
+                        cleaned = _clean_fuse_line(m.group(2).strip())
+                        if cleaned:
+                            parsed[int(m.group(1)) - 1] = cleaned
+                    elif ":" in line:
+                        try:
+                            idx_str, cp = line.split(":", 1)
+                            cleaned = _clean_fuse_line(cp.strip())
+                            if cleaned:
+                                parsed[int(re.sub(r'\D', '', idx_str)) - 1] = cleaned
+                        except: pass
+                for j in range(len(batch_segs)):
+                    if j not in parsed and len(lines) == len(batch_segs):
+                        if ":" in lines[j]:
+                            _, parsed[j] = lines[j].split(":", 1)
+                            parsed[j] = parsed[j].strip()
+                        else:
+                            parsed[j] = lines[j]
+                return parsed, False  # success, no hallucination
+
+            # ── 递归拆分融合（幻觉时自动切半重试） ──
+            MIN_SUB_BATCH = 5  # 最小子批次，再小直接回退原文
+            def _fuse_with_split(batch_segs, base_idx, glm_texts=None, depth=0):
+                """融合一批片段，幻觉时拆分重试；返回填充 final_results 的数量"""
+                size = len(batch_segs)
+                if size <= 1:
+                    # 单个片段，直接保留原文
+                    final_results[base_idx] = {
+                        "start": batch_segs[0]["start"], "end": batch_segs[0]["end"],
+                        "text": batch_segs[0]["text"]
+                    }
+                    return 1
+
+                prefix = f"(d{depth})" if depth > 0 else ""
                 try:
-                    prompt = prompt_template.format(
-                        text=combined_context,
-                        terminology=term_str,
-                        count=len(batch)
-                    )
-                except KeyError:
-                    prompt = _default_prompt_tpl.format(text=combined_context, count=len(batch))
-            else:
-                prompt = _default_prompt_tpl.format(text=combined_context, count=len(batch))
-
-            # ── 带重试 + 模型降级 + 粘性 ──
-            max_retries = 3
-            fused_this_batch = False
-            
-            for attempt in range(max_retries):
-                try:
-                    wait_for_llm_api()
-                    response = client.chat.completions.create(
-                        model=current_model,
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.1,
-                        max_tokens=2000,
-                        timeout=120
-                    )
-                    
-                    content = response.choices[0].message.content.strip()
-                    lines = [line.strip() for line in content.split('\n') if line.strip()]
-                    
-                    temp_map = {}
-                    for line in lines:
-                        match = re.match(r'^(\d+)\s*[:：]\s*(.*)$', line)
-                        if match:
-                            idx = int(match.group(1)) - 1
-                            temp_map[idx] = match.group(2).strip()
-                        elif ":" in line:
-                            try:
-                                idx_str, content_part = line.split(":", 1)
-                                idx = int(re.sub(r'\D', '', idx_str)) - 1
-                                temp_map[idx] = content_part.strip()
-                            except: pass
-
-                    for j, seg in enumerate(batch):
-                        fused_text = temp_map.get(j)
-                        if not fused_text and len(lines) == len(batch):
-                            curr_line = lines[j]
-                            if ":" in curr_line:
-                                _, fused_text = curr_line.split(":", 1)
-                                fused_text = fused_text.strip()
-                            else:
-                                fused_text = curr_line
-                        
-                        global_idx = i + j
-                        final_results[global_idx] = {
-                            "start": seg["start"], 
-                            "end": seg["end"], 
-                            "text": fused_text if fused_text else seg["text"]
-                        }
-                    
-                    fused_this_batch = True
-                    completed_batches += 1
-                    progress_pct = (completed_batches / total_batches * 100) if total_batches > 0 else 0
-                    logger.info(f"批次 {batch_num}/{total_batches} 融合完成 ({progress_pct:.1f}%)")
-                    break  # 成功，跳出重试
-                    
+                    parsed, hallucinated = _try_fuse_one(batch_segs, glm_texts)
+                    if hallucinated:
+                        if size <= MIN_SUB_BATCH:
+                            logger.warning(
+                                f"  {prefix}批次幻觉且已达最小拆分({size}条)，回退原文")
+                            for j, seg in enumerate(batch_segs):
+                                final_results[base_idx + j] = {
+                                    "start": seg["start"], "end": seg["end"],
+                                    "text": seg["text"]
+                                }
+                            return size
+                        # 拆半递归（同时拆分 glmm 文本）
+                        mid = size // 2
+                        glm_left = glm_texts[:mid] if glm_texts else None
+                        glm_right = glm_texts[mid:] if glm_texts else None
+                        logger.info(
+                            f"  {prefix}批次幻觉，拆分重试: {size}→{mid}+{size-mid}")
+                        n1 = _fuse_with_split(batch_segs[:mid], base_idx, glm_left, depth + 1)
+                        n2 = _fuse_with_split(batch_segs[mid:], base_idx + mid, glm_right, depth + 1)
+                        return n1 + n2
+                    else:
+                        for j, seg in enumerate(batch_segs):
+                            fused_text = parsed.get(j)
+                            final_results[base_idx + j] = {
+                                "start": seg["start"], "end": seg["end"],
+                                "text": fused_text if fused_text else seg["text"]
+                            }
+                        return size
                 except Exception as e:
                     err_msg_lower = str(e).lower()
-                    # 致命错误
-                    if any(kw in err_msg_lower for kw in ('balance', 'insufficient', 'invalid', 'unauthorized', '403', '401')):
+                    if any(kw in err_msg_lower for kw in
+                           ('balance', 'insufficient', 'invalid', 'unauthorized', '403', '401')):
+                        nonlocal llm_disabled
                         llm_disabled = True
-                        logger.error(f"批次融合致命错误 (批次 {batch_num}/{total_batches}): {e}")
-                        logger.warning("检测到致命 API 错误，将跳过后续所有批次")
-                        break
-                    
-                    # 429 限流 → 通知全局过载检测器
-                    is_rate_limit = '429' in str(e) or 'rate' in err_msg_lower or 'too busy' in err_msg_lower
-                    if is_rate_limit:
+                        logger.error(f"  {prefix}致命 API 错误，后续批次回退原文: {e}")
+                    elif '429' in str(e) or 'rate' in err_msg_lower or 'too busy' in err_msg_lower:
                         mark_model_overloaded()
-                    if is_rate_limit and attempt < max_retries - 1:
-                        # 尝试切换到备用模型
-                        if fallback_model and current_model != fallback_model and attempt >= 1:
-                            logger.info(f"  主模型受限，切换到备用模型: {fallback_model.split('/')[-1]}")
-                            current_model = fallback_model
-                            model_sticky = True  # 启用粘性，后续批次也用备用
-                        delay = (2 ** (attempt + 1)) * (0.5 + random.random())  # 2~4s, 4~8s
-                        model_label = current_model.split('/')[-1]
-                        logger.warning(f"  ASR融合限流 [{model_label}]，{delay:.1f}s 后重试 ({attempt + 1}/{max_retries})...")
-                        time.sleep(delay)
-                        continue
-                    
-                    logger.error(f"批次融合失败 (批次 {batch_num}/{total_batches}): {e}")
-                    break
-            
-            # 降级：使用原文
-            if not fused_this_batch:
-                for j, seg in enumerate(batch):
-                    global_idx = i + j
-                    final_results[global_idx] = {"start": seg["start"], "end": seg["end"], "text": seg["text"]}
-                completed_batches += 1
-                progress_pct = (completed_batches / total_batches * 100) if total_batches > 0 else 0
-                logger.info(f"批次 {batch_num}/{total_batches} 使用原文 ({progress_pct:.1f}%)")
+                        logger.warning(f"  {prefix}限流，回退原文")
+                    else:
+                        logger.warning(f"  {prefix}融合失败，回退原文: {e}")
+                    for j, seg in enumerate(batch_segs):
+                        final_results[base_idx + j] = {
+                            "start": seg["start"], "end": seg["end"],
+                            "text": seg["text"]
+                        }
+                    return size
+
+            # ── 调用拆分融合（传入双模型文本） ──
+            glm_batch_texts = None
+            if has_second_model:
+                glm_batch = glm_segs[i:i + len(batch)]
+                glm_batch_texts = [g.get('text', '') for g in glm_batch]
+            _fuse_with_split(batch, i, glm_batch_texts)
+            logger.info(f"批次 {batch_num}/{total_batches} 完成 ({batch_num*100//total_batches}%)")
 
         logger.success(f"多模型融合修正完成，共 {len(final_results)} 段。")
         return final_results

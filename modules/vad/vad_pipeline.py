@@ -40,7 +40,7 @@ def run_vad(audio_path, output_dir="cache/vad", device="cuda", model_size="large
             results.append({
                 "start": round(segment.start, 3),
                 "end": round(segment.end, 3),
-                "text": ""  # VAD 阶段不关注文本，但保留字段以兼容后端
+                "text": segment.text.strip()
             })
 
         # 保存结果

@@ -2,8 +2,11 @@ import os
 import json
 import hashlib
 import re
+import time
+import random
 from loguru import logger
 from openai import OpenAI
+from modules.utils.rate_limiter import wait_for_llm_api, mark_model_overloaded
 
 
 def _get_cache_path():
@@ -113,7 +116,13 @@ def process_tts_text(text, config=None, prompt_template=None):
         return text
 
 
-def process_tts_text_batch(texts, config=None, prompt_template=None, batch_size=30):
+def process_tts_text_batch(texts, config=None, prompt_template=None, batch_size=None):
+    # 批次太大容易导致 LLM 截断返回（只输出编号不输出内容）
+    # 优先级：显式参数 > config['batch_size'] > config['tts_processor']['batch_size'] > 默认 8
+    if batch_size is None:
+        if config:
+            batch_size = config.get('batch_size') or config.get('tts_processor', {}).get('batch_size')
+        batch_size = batch_size or 8
     """
     批量处理 TTS 文本，一次 LLM 调用处理多条，大幅降低 API 调用次数和 token 消耗。
     同时内置文件缓存，相同输入文本不会重复调用 LLM。
@@ -180,38 +189,74 @@ def process_tts_text_batch(texts, config=None, prompt_template=None, batch_size=
         else:
             prompt = _default_batch_prompt(numbered, len(batch_texts))
 
-        try:
-            logger.info(f"TTS 批次 {batch_num}/{total_batches} ({len(batch_texts)} 条)...")
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_tokens=2000
-            )
-            content = response.choices[0].message.content.strip()
-            lines = [line.strip() for line in content.split('\n') if line.strip()]
+        max_retries = 3
+        base_delay = 3
+        batch_ok = False
 
-            # 解析编号格式的响应
-            parsed = _parse_numbered_response(lines, len(batch_texts))
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"TTS 批次 {batch_num}/{total_batches} ({len(batch_texts)} 条)...")
+                wait_for_llm_api()
+                # 动态 max_tokens：输入字符数 × 3（输出中文 token 开销大于输入英文）
+                # 最少 2000，防止模型因 token 不足而截断行尾内容
+                input_chars = sum(len(t) for t in batch_texts)
+                dynamic_max_tokens = max(2000, int(input_chars * 3))
+                logger.debug(f"TTS 批次 max_tokens={dynamic_max_tokens} (输入 {input_chars} 字符)")
+                response = client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1,
+                    max_tokens=dynamic_max_tokens
+                )
+                content = response.choices[0].message.content.strip()
+                lines = [line.strip() for line in content.split('\n') if line.strip()]
 
-            for j, orig_idx in enumerate(range(batch_idx, batch_idx + len(batch_texts))):
-                processed = parsed.get(j, "")
-                if processed:
-                    processed = _clean_response(processed)
-                    if _is_noop_response(processed):
-                        processed = uncached_texts[orig_idx]
-                else:
-                    processed = uncached_texts[orig_idx]
+                # 解析编号格式的响应
+                parsed = _parse_numbered_response(lines, len(batch_texts))
 
-                global_idx = uncached_indices[orig_idx]
-                results[global_idx] = processed
-                key = _text_hash(uncached_texts[orig_idx])
-                new_cache_entries[key] = processed
+                for j, orig_idx in enumerate(range(batch_idx, batch_idx + len(batch_texts))):
+                    original_text = uncached_texts[orig_idx]
+                    processed = parsed.get(j, "")
+                    if processed:
+                        processed = _clean_response(processed)
+                        if _is_noop_response(processed):
+                            processed = original_text
+                    else:
+                        processed = original_text
 
-            logger.info(f"TTS 批次 {batch_num}/{total_batches} 完成 ({batch_num*100//total_batches}%)")
+                    # 质量验证：结果太短（可能是 LLM 截断），回退到原文
+                    if processed and len(processed) < 5 and len(original_text) > 10:
+                        logger.warning(
+                            f"TTS 预处理结果疑似截断（结果{len(processed)}字 vs 原文{len(original_text)}字），"
+                            f"回退原文: '{processed[:50]}' → '{original_text[:50]}...'"
+                        )
+                        processed = original_text
 
-        except Exception as e:
-            logger.error(f"TTS 批次 {batch_num}/{total_batches} 失败: {e}")
+                    global_idx = uncached_indices[orig_idx]
+                    results[global_idx] = processed
+                    key = _text_hash(original_text)
+                    new_cache_entries[key] = processed
+
+                logger.info(f"TTS 批次 {batch_num}/{total_batches} 完成 ({batch_num*100//total_batches}%)")
+                batch_ok = True
+                break  # 成功，跳出重试循环
+
+            except Exception as e:
+                err_msg = str(e).lower()
+                is_rate_limit = '429' in str(e) or 'rate' in err_msg or 'too busy' in err_msg
+
+                if is_rate_limit and attempt < max_retries - 1:
+                    mark_model_overloaded()
+                    delay = (base_delay ** (attempt + 1)) * (0.5 + random.random())
+                    logger.warning(f"TTS 预处理限流，{delay:.1f}s 后重试 ({attempt + 1}/{max_retries})...")
+                    time.sleep(delay)
+                    continue
+
+                logger.error(f"TTS 批次 {batch_num}/{total_batches} 失败: {e}")
+                break
+
+        # 所有重试都失败 → 回退到原文（不缓存，下次重试）
+        if not batch_ok:
             for j, orig_idx in enumerate(range(batch_idx, batch_idx + len(batch_texts))):
                 global_idx = uncached_indices[orig_idx]
                 results[global_idx] = uncached_texts[orig_idx]
@@ -229,8 +274,8 @@ def process_tts_text_batch(texts, config=None, prompt_template=None, batch_size=
 def _default_batch_prompt(numbered_text, count):
     """默认批量提示词"""
     return (
-        "数字→中文口语。价格11,234→一万一千两百三十四，2024年→二零二四年，"
-        f"10:30→十点三十分，50%→百分之五十。格式：\"数字: 结果\"，共{count}行，不解释。\n\n"
+        "数字→中文口语，如11,234→一万一千两百三十四，"
+        f"50%→百分之五十。格式：\"数字: 结果\"，共{count}行，不解释。\n\n"
         f"{numbered_text}"
     )
 
@@ -242,19 +287,27 @@ def _parse_numbered_response(lines, expected_count):
         match = re.match(r'^(\d+)\s*[:：]\s*(.*)$', line)
         if match:
             idx = int(match.group(1)) - 1
-            result[idx] = match.group(2).strip()
+            content = match.group(2).strip()
+            if content:  # 只保留非空内容
+                result[idx] = content
         elif ':' in line or '：' in line:
-            idx_str, _, content = line.partition(':') if ':' in line else line.partition('：')
+            sep = ':' if ':' in line else '：'
+            idx_str, _, content = line.partition(sep)
             try:
                 idx = int(re.sub(r'\D', '', idx_str)) - 1
-                result[idx] = content.strip()
+                content = content.strip()
+                if content:
+                    result[idx] = content
             except ValueError:
                 pass
 
     # 如果解析到的条目不够，尝试按行号对齐
+    # 关键修复：必须剥离编号前缀，否则 TTS 引擎会读出行号数字
     if len(result) < expected_count and len(lines) == expected_count:
         for i, line in enumerate(lines):
             if i not in result:
-                result[i] = line
+                # 尝试剥离可能的编号前缀再使用
+                stripped = re.sub(r'^\d+\s*[:：]\s*', '', line).strip()
+                result[i] = stripped if stripped else line
 
     return result

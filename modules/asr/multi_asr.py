@@ -62,11 +62,14 @@ class ASRModelLoader:
                 return None
         return self._models["funasr"]
 
-def run_multi_asr(audio_path, segments, output_dir="cache/asr", device="cuda", model_size="large-v3"):
+def run_multi_asr(audio_path, segments, output_dir="cache/asr", device="cuda", model_size="large-v3", language=None):
     """
     多 ASR 识别模块。使用双模型架构：
     1. WhisperX / Faster-Whisper (Ground Truth 时间轴)
     2. GLM / SenseVoice (FunASR)
+
+    Args:
+        language: Whisper 识别语言，None=自动检测，'en'=强制英文，'zh'=强制中文等
     """
     # 确保路径是绝对路径
     audio_path = os.path.abspath(audio_path)
@@ -79,9 +82,17 @@ def run_multi_asr(audio_path, segments, output_dir="cache/asr", device="cuda", m
     output_path = os.path.join(output_dir, f"{base_name}_multi_asr.json")
 
     if os.path.exists(output_path):
-        logger.info(f"使用 Multi-ASR 缓存: {output_path}")
-        with open(output_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+        try:
+            with open(output_path, 'r', encoding='utf-8') as f:
+                cached = json.load(f)
+            # 缓存版本检测：如果 glm 为空且 whisperx 有数据，说明是旧缓存，需要重新生成
+            if not cached.get("glm") and cached.get("whisperx"):
+                logger.info("缓存中缺少 GLM 结果（旧版本），将重新执行双模型识别")
+            else:
+                logger.info(f"使用 Multi-ASR 缓存: {output_path}")
+                return cached
+        except (json.JSONDecodeError, UnicodeDecodeError, KeyError) as e:
+            logger.warning(f"Multi-ASR 缓存文件损坏 ({e})，将重新生成")
 
     loader = ASRModelLoader()
     multi_results = {"whisperx": [], "glm": []}
@@ -89,8 +100,14 @@ def run_multi_asr(audio_path, segments, output_dir="cache/asr", device="cuda", m
     try:
         # --- 1. WhisperX (Faster-Whisper) ---
         fw_model = loader.get_fw_model(model_size, device)
-        logger.info("开始 WhisperX 转录...")
-        segments_res, info = fw_model.transcribe(audio_path, beam_size=5)
+        # 构建 transcribe 参数：指定语言则强制使用，否则自动检测
+        transcribe_kwargs = {"beam_size": 5}
+        if language:
+            transcribe_kwargs["language"] = language
+            logger.info(f"开始 WhisperX 转录（强制语言: {language}）...")
+        else:
+            logger.info("开始 WhisperX 转录（自动检测语言）...")
+        segments_res, info = fw_model.transcribe(audio_path, **transcribe_kwargs)
         
         # 检测到的语言（如有）
         detected_lang = info.language if hasattr(info, 'language') else 'N/A'

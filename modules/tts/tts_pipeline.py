@@ -1,8 +1,6 @@
 import os
 import json
 import asyncio
-import aiofiles
-import edge_tts
 import subprocess
 from loguru import logger
 from pydub import AudioSegment
@@ -10,6 +8,7 @@ from pydub import AudioSegment
 # 必须在导入 pydub 之前设置 FFmpeg 路径
 from modules.utils.ffmpeg_utils import get_ffmpeg_exe, get_ffprobe_exe
 from modules.utils.media_utils import get_media_duration, validate_media_file
+from modules.tts.engines import create_tts_engine
 
 ffmpeg_exe = get_ffmpeg_exe()
 ffprobe_exe = get_ffprobe_exe()
@@ -92,44 +91,7 @@ def get_media_duration(media_path):
         logger.debug(traceback.format_exc())
         return None
 
-async def _generate_edge_tts(text, voice, path, max_retries=2):
-    """单条语音合成任务（带重试机制）"""
-    for attempt in range(max_retries + 1):
-        try:
-            abs_path = os.path.abspath(path)
-            # 确保目录存在
-            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-            
-            # 检查文本是否为空
-            if not text or not text.strip():
-                logger.error(f"文本为空，跳过合成: {path}")
-                return False
-            
-            logger.debug(f"开始合成片段 {os.path.basename(path)}: '{text[:50]}...'")
-            communicate = edge_tts.Communicate(text, voice)
-            await communicate.save(abs_path)
-            
-            if validate_media_file(abs_path):
-                logger.debug(f"片段 {os.path.basename(path)} 合成成功: {os.path.getsize(abs_path)} bytes")
-                return True
-            else:
-                file_size = os.path.getsize(abs_path) if os.path.exists(abs_path) else 0
-                if attempt < max_retries:
-                    logger.warning(f"Edge-TTS 生成文件无效 ({file_size} bytes)，重试 {attempt + 1}/{max_retries}: {abs_path}")
-                    continue
-                else:
-                    logger.error(f"Edge-TTS 生成文件无效 ({file_size} bytes, 可能网络问题或文本为空): {abs_path}")
-                    return False
-        except Exception as e:
-            if attempt < max_retries:
-                logger.warning(f"Edge-TTS 合成失败 ({voice})，重试 {attempt + 1}/{max_retries}: {e}")
-                await asyncio.sleep(1)  # 等待 1 秒后重试
-            else:
-                logger.error(f"Edge-TTS 合成失败 ({voice}): {e}")
-                import traceback
-                logger.debug(traceback.format_exc())
-                return False
-    return False
+
 
 def merge_audio_with_pydub(temp_files, output_path):
     """
@@ -186,33 +148,103 @@ def merge_audio_with_pydub(temp_files, output_path):
         logger.debug(traceback.format_exc())
         return False
 
-async def generate_tts(translated_results, output_dir="cache/tts", voice="zh-CN-XiaoxiaoNeural", config=None, original_video_path=None):
+def _detect_source_language(text):
+    """检测文本的主要语言，返回 ('zh', ratio) 或 ('en', ratio) 等。"""
+    if not text or not text.strip():
+        return 'unknown', 0.0
+    import unicodedata
+    total = len(text)
+    cjk = sum(1 for c in text if 'CJK' in unicodedata.name(c, ''))
+    latin = sum(1 for c in text if c.isascii() and c.isalpha())
+    if total == 0:
+        return 'unknown', 0.0
+    cjk_ratio = cjk / total
+    latin_ratio = latin / total
+    if cjk_ratio > 0.15:
+        return 'zh', cjk_ratio
+    if latin_ratio > 0.3:
+        return 'en', latin_ratio
+    return 'mixed', 0.0
+
+
+def _check_tts_language(segments, target_lang='zh'):
+    """检查 TTS 文本是否与目标语言一致，不一致时记录警告。
+    
+    Returns:
+        (clean_count, warn_count, skip_count, sanitized_segments)
+        sanitized_segments 中标记了 _lang_warn 或 _lang_skip 字段
+    """
+    clean, warned, skipped = 0, 0, 0
+    for i, seg in enumerate(segments):
+        text = seg.get("tts_text") or seg.get("translated_text") or seg.get("text")
+        if not text or not text.strip():
+            skipped += 1
+            seg['_lang_skip'] = True
+            continue
+        detected, ratio = _detect_source_language(text)
+        if target_lang == 'zh' and detected == 'en':
+            # 英文文本但目标语言是中文 → 仍然生成但严重警告
+            seg['_lang_warn'] = True
+            seg['_lang_detected'] = 'en'
+            warned += 1
+            logger.warning(
+                f"⚠️  TTS 语言不匹配 [片段{i}]：检测到英文(ratio={ratio:.0%})，"
+                f"但目标语言是中文。文本: {text[:80]}..."
+            )
+        elif detected == target_lang or detected == 'mixed':
+            clean += 1
+        else:
+            clean += 1  # 不确定的情况也放行
+    if warned > 0:
+        logger.warning(
+            f"⚠️  语言检测结果: {clean}条正常, {warned}条疑似英文({len(segments)}条总数)"
+        )
+    else:
+        logger.info(f"✅ 语言检测通过: 全部 {len(segments)} 条与目标语言一致")
+    return clean, warned, skipped
+
+
+async def generate_tts(translated_results, output_dir="cache/tts", voice=None, config=None,
+                       original_video_path=None, target_lang='zh'):
     """
     异步合成所有 TTS 片段并合并。
-    
+    根据 config['provider'] 自动选择 TTS 引擎。
+
     Args:
         translated_results: 翻译结果列表
         output_dir: 输出目录
-        voice: TTS 语音选择
-        config: TTS 配置
+        voice: （可选）全局语音覆盖，仅 edge provider 使用。None 时使用引擎默认配置
+        config: TTS 配置字典，必须包含 provider 字段
         original_video_path: 原始视频路径（用于时长对齐）
+        target_lang: 目标语言，用于生成前语言检测（默认 'zh'）
     """
+    if config is None:
+        config = {'provider': 'edge', 'edge': {'voice': 'zh-CN-YunyangNeural'}}
+
     output_dir = os.path.abspath(output_dir)
     if not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
+    # ── TTS 生成前语言检测：确保文本已是目标语言 ──
+    _check_tts_language(translated_results, target_lang=target_lang)
+
+    # 根据 provider 创建引擎实例
+    engine = create_tts_engine(config, voice=voice)
+    provider_name = config.get('provider', 'edge')
+    logger.info(f"TTS 引擎: {provider_name}")
+
     tasks = []
     temp_files_to_merge = []
     
-    # 降低并发数以提高稳定性（从 10 降到 5）
-    sem = asyncio.Semaphore(5)
+    concurrency = 5
+    sem = asyncio.Semaphore(concurrency)
 
     async def sem_task(task_info):
         async with sem:
             idx, text, path = task_info
-            return await _generate_edge_tts(text, voice, path)
+            return await engine.synthesize(text, path)
 
-    logger.info(f"开始异步合成 {len(translated_results)} 段语音...")
+    logger.info(f"开始异步合成 {len(translated_results)} 段语音（并发数: {concurrency}）...")
     
     # 构建任务列表
     for i, seg in enumerate(translated_results):
@@ -318,6 +350,9 @@ async def generate_tts(translated_results, output_dir="cache/tts", voice="zh-CN-
         if actual_duration is not None:
             logger.info(f"TTS 音频合成完成，总时长: {actual_duration:.2f}s")
             logger.success(f"音画同步优化：已基于 Pydub 实现平滑过渡")
+
+    # 释放引擎资源（本地模型需卸载以释放内存）
+    engine.cleanup()
 
     logger.success(f"TTS 合成流程结束: {full_output_path}")
     return full_output_path

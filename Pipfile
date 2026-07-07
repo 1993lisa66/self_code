@@ -37,6 +37,7 @@ pyyaml = "*"
 edge-tts = "*"
 aiofiles = "*"
 openai = "*"
+googletrans = ">=3.1.0a0"
 
 [dev-packages]
 

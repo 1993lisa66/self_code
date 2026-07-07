@@ -198,7 +198,8 @@ class VideoTranslationPipeline:
                 segments,
                 output_dir=os.path.join(target_cache_dir, "asr"),
                 device=self.config['asr']['device'],
-                model_size=self.config['asr'].get('model_size', 'large-v3')
+                model_size=self.config['asr'].get('model_size', 'large-v3'),
+                language=self.config['asr'].get('language') if self.config['asr'].get('language') != 'auto' else None,
             )
             final_result_data["steps"]["asr"] = {"results": asr_results}
             
@@ -230,12 +231,18 @@ class VideoTranslationPipeline:
             except Exception as e:
                 logger.warning(f"回填 VAD 缓存失败 (不影响主流程): {e}")
             
-            # STEP 5: LLM 翻译
-            logger.info("STEP 5: LLM翻译")
+            # STEP 5: 翻译
+            logger.info("STEP 5: 翻译")
+            # 合并翻译引擎配置（provider: llm/google）
+            translate_cfg = self.config.get('translate', {})
+            merged_config = dict(self.config.get('llm', {}))
+            if translate_cfg:
+                merged_config['provider'] = translate_cfg.get('provider', 'llm')
+                merged_config['google_delay'] = translate_cfg.get('google_delay', 0.3)
             translated_results = translate_segments(
                 resegmented_results, 
                 target_lang=self.config['translate']['target_language'],
-                config=self.config['llm'],
+                config=merged_config,
                 prompt_template=self.prompts.get('translation')
             )
             final_result_data["steps"]["translation"] = {"results": translated_results}
@@ -252,13 +259,14 @@ class VideoTranslationPipeline:
             def process_single_segment(idx_seg):
                 """处理单个片段的函数"""
                 idx, seg = idx_seg
+                # 保存原始语言文本（如英文），供 tts_preprocessed.json 等下游使用
                 original_text = seg.get("translated_text", seg["text"])
                 tts_text = process_tts_text(
                     original_text, 
                     config=self.config['llm'], 
                     prompt_template=self.prompts.get('tts_prep')
                 )
-                return idx, tts_text
+                return idx, tts_text, seg.get("text", "")  # 返回原文供回填
             
             # 使用线程池并发处理（最多 10 个并发）
             max_workers = min(10, total_segments)
@@ -270,8 +278,11 @@ class VideoTranslationPipeline:
                 
                 completed = 0
                 for future in as_completed(futures):
-                    idx, tts_text = future.result()
+                    idx, tts_text, original_text = future.result()
                     translated_results[idx]["tts_text"] = tts_text
+                    # 回填原始语言文本（如英文），确保 tts_preprocessed.json 包含原文
+                    if original_text and not translated_results[idx].get("original_text"):
+                        translated_results[idx]["original_text"] = original_text
                     completed += 1
                     
                     # 每完成 10% 或至少每 10 个显示一次进度
@@ -282,7 +293,6 @@ class VideoTranslationPipeline:
             tts_audio = asyncio.run(generate_tts(
                 translated_results,
                 output_dir=os.path.join(target_cache_dir, "tts"),
-                voice=self.config['tts']['voice'],
                 config=self.config['tts']
             ))
             final_result_data["steps"]["tts"] = {"path": tts_audio}

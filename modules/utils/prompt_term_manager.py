@@ -218,67 +218,6 @@ class PromptTermManager:
             logger.error(f"提示词优化失败: {e}")
             return ""
     
-    def create_batch_prompts(self, batch_name, video_topics=None):
-        """
-        为特定批次视频创建专属的提示词和术语
-        
-        Args:
-            batch_name: 批次名称（如：ICT_Trading_Batch1）
-            video_topics: 视频主题列表
-        
-        Returns:
-            dict: 创建的批处理配置
-        """
-        # 创建批处理目录（使用优化后的目录结构）
-        batch_dir = os.path.join(self.batches_dir, batch_name)
-        os.makedirs(batch_dir, exist_ok=True)
-        
-        # 复制基础提示词
-        base_prompts = self.list_prompts()
-        batch_prompts_dir = os.path.join(batch_dir, "prompts")
-        os.makedirs(batch_prompts_dir, exist_ok=True)
-        
-        for prompt_name in base_prompts:
-            content = self.load_prompt(prompt_name)
-            self._save_to_file(os.path.join(batch_prompts_dir, f"{prompt_name}.txt"), content)
-        
-        # 创建批次专属术语表
-        batch_terminology = {}
-        if video_topics:
-            # 根据主题生成相关术语
-            topics_text = "\n".join(video_topics)
-            extracted_terms = self.extract_terms_from_text(topics_text, domain="trading")
-            batch_terminology.update(extracted_terms)
-        
-        # 合并全局术语表
-        global_terminology = self.load_terminology()
-        batch_terminology.update(global_terminology)
-        
-        # 保存批次术语表
-        batch_terminology_file = os.path.join(batch_dir, "terminology.json")
-        with open(batch_terminology_file, 'w', encoding='utf-8') as f:
-            json.dump(batch_terminology, f, ensure_ascii=False, indent=2)
-        
-        # 创建批次配置文件
-        batch_config = {
-            "batch_name": batch_name,
-            "created_at": "",
-            "video_topics": video_topics or [],
-            "prompts_dir": "prompts",
-            "terminology_file": "terminology.json",
-            "description": f"Batch: {batch_name}"
-        }
-        
-        batch_config_file = os.path.join(batch_dir, "batch_config.yaml")
-        with open(batch_config_file, 'w', encoding='utf-8') as f:
-            yaml.dump(batch_config, f, allow_unicode=True, default_flow_style=False)
-        
-        logger.success(f"批处理配置已创建: {batch_dir}")
-        return {
-            "batch_dir": batch_dir,
-            "prompts_count": len(base_prompts),
-            "terminology_count": len(batch_terminology)
-        }
     
     def merge_terminology(self, new_terms, auto_save=True):
         """
@@ -379,17 +318,6 @@ def main():
     if extracted:
         for term, trans in extracted.items():
             print(f"  - {term}: {trans}")
-    print()
-    
-    # 4. 创建批处理配置（示例）
-    print("📦 创建批处理配置示例:")
-    batch_info = manager.create_batch_prompts(
-        batch_name="ICT_Trading_Demo",
-        video_topics=["ICT Concepts", "Fair Value Gap", "Order Blocks"]
-    )
-    print(f"  - 批处理目录: {batch_info['batch_dir']}")
-    print(f"  - 提示词数量: {batch_info['prompts_count']}")
-    print(f"  - 术语数量: {batch_info['terminology_count']}")
     print()
     
     print("="*60)

@@ -135,7 +135,7 @@ def run_ffmpeg_command(cmd: list, description: str = "FFmpeg 命令",
     result = subprocess.run(
         cmd,
         capture_output=capture_output,
-        text=not capture_output,  # 如果是二进制输出，不使用文本模式
+        text=True,  # 始终使用文本模式，避免中文路径 bytes 编码问题
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
         env=env  # 使用自定义环境变量
     )

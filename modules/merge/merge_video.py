@@ -31,9 +31,9 @@ def merge_video(video_path, tts_audio, output_dir="outputs", config=None, output
     base_name = output_name if output_name else os.path.splitext(os.path.basename(video_path))[0]
     output_path = os.path.join(output_dir, f"{base_name}.mp4")
 
-    # 获取时长
-    v_dur = get_media_duration(video_path) or 0
-    a_dur = get_media_duration(tts_audio) or 0
+    # 获取时长（优先用 ffprobe，中文路径 pydub 可能失败）
+    v_dur = get_media_duration(video_path, use_pydub=False) or 0
+    a_dur = get_media_duration(tts_audio, use_pydub=False) or 0
     
     logger.info(f"视频时长: {v_dur:.2f}s, 音频时长: {a_dur:.2f}s")
     

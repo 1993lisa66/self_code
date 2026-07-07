@@ -1,5 +1,8 @@
 {
-  "ICT": "内圈交易者",
+  "ICT": "ICT",
+  "SMC": "SMC",
+  "Candle": "蜡烛",
+  "Full Course": "完整课程",
   "FVG": "公允价值缺口",
   "Order Block": "订单块",
   "Liquidity": "流动性",

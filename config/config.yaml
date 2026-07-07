@@ -1,6 +1,8 @@
 asr:
   device: cpu
   model_id: iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch
+  # ASR 识别语言：auto（自动检测）| en（强制英文）| zh（强制中文）| ja 等
+  language: auto
   model_size: base
   terminology_file: config/terminology.json
   voting_models:
@@ -13,10 +15,12 @@ audio:
 global:
   auto_cleanup_cache: true
   max_concurrency:
-    video_processor: 1
+    # 本地计算（音频提取、VAD、ASR、FFmpeg）多进程并行
+    # LLM / TTS 等远程 API 调用已通过文件锁串行化，不会触发限速
+    video_processor: 6
 llm:
   api_base: https://api.siliconflow.cn/v1
-  api_key: sk-ciflsfsoebgnuzsyhsuciwgvqvqosjkasdtsvphzxwttjqmt
+  api_key: sk-pyxmrlxwmhgcvztkwmudjoyyypnbvwbkoctfixqqhcojeufg
   # 主模型限流时自动降级的备用模型（更轻量，容量更充足）
   fallback_model: Qwen/Qwen2.5-7B-Instruct
   chapter_generator:
@@ -37,6 +41,8 @@ llm:
   tts_processor:
     model: deepseek-ai/DeepSeek-V3
     temperature: 0.1
+    # TTS 预处理每批条目数，太大容易导致模型截断返回
+    batch_size: 5
 paths:
   assets_dir: assets
   batches_dir: config/batches
@@ -51,10 +57,23 @@ project:
   name: TransVoice
 translate:
   target_language: zh
+  # 翻译引擎: llm（大模型翻译，质量高但需 API Key）| google（免费快速，质量中等）
+  provider: llm
+  # Google 翻译请求间隔（秒），越小越快但可能被封
+  google_delay: 0.3
+  # LLM 翻译每批处理的片段数（默认 20），太大容易超出 token 限制导致末尾截断
+  batch_size: 15
 tts:
+  # TTS 引擎: edge（微软免费在线语音合成）
   provider: edge
   speed_limit: 1.5
-  voice: zh-CN-YunyangNeural
+
+  # ── Edge TTS（微软免费在线语音合成）─────────────────────────
+  edge:
+    # 中文语音: zh-CN-YunyangNeural, zh-CN-XiaoxiaoNeural, zh-CN-YunxiNeural
+    # 英文语音: en-US-AriaNeural, en-US-JennyNeural, en-US-GuyNeural
+    voice: zh-CN-YunyangNeural
+
 vad:
   min_silence_duration_ms: 300
   min_speech_duration_ms: 250
