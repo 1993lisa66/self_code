@@ -1,6 +1,7 @@
 .idea
 .git
 .DS_Store
+__pycache__/
 
 /logs/
 /input/
@@ -13,4 +14,5 @@ Pipfile.lock
 /models/
 /ex/
 /config/batches/
+/bilibili_cookies.txt
 
