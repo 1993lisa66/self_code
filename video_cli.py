@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""统一视频处理工具 —— 9 步断点续跑管道，三模式自适应。"""
+"""统一视频处理工具 —— 9 步断点续跑管道，单视频串行，三模式自适应。"""
 
 from __future__ import annotations
 
 import argparse, glob, json, multiprocessing, os, re, shutil, sys, time, warnings
-from concurrent.futures import ProcessPoolExecutor, as_completed
+
 from pathlib import Path
 
 import yaml
@@ -106,59 +106,6 @@ def collect_video_files(path: str) -> list[str] | None:
     return files or None
 
 
-# ═══════════════════════════════════════════════════════
-#  多进程编排
-# ═══════════════════════════════════════════════════════
-
-def _worker(args: tuple) -> dict:
-    vp, cfg, mode, inp, out, skip = args
-    if mode.startswith('_'):
-        return process_substep(vp, cfg, mode, inp, out, skip_llm_fix=skip)
-    from modules.pipeline.processor import process_video_unified
-    return process_video_unified(vp, cfg, mode, inp, out, skip_llm_fix=skip)
-
-
-def batch_run(videos: list[str], config: dict, mode: str,
-              input_dir: str, output_dir: str, skip_llm: bool,
-              workers: int, label: str = "") -> tuple[list[dict], float]:
-    """多进程执行一批视频。"""
-    tasks = [(v, config, mode, input_dir, output_dir, skip_llm) for v in videos]
-    if not tasks:
-        return [], 0.0
-
-    title = f"【{label}】" if label else ""
-    print(f"🚀 {title}多进程 {workers} 路\n")
-    t0, results, n, N = time.time(), [], 0, len(videos)
-
-    with ProcessPoolExecutor(max_workers=workers) as pool:
-        fmap = {pool.submit(_worker, t): t[0] for t in tasks}
-        for f in as_completed(fmap):
-            vf = fmap[f]; n += 1
-            try:
-                r = f.result()
-                results.append(r)
-                s = r.get('status', 'failed')
-                logger.info(f"  [{n}/{N}] ({n/N*100:.0f}%) {ICON.get(s, '❓')} {os.path.basename(vf)}")
-            except Exception as e:
-                logger.error(f"  异常 {os.path.basename(vf)}: {e}")
-                results.append({'video_path': vf, 'status': 'failed',
-                                'message': str(e), 'output_name': Path(vf).stem})
-    return results, time.time() - t0
-
-
-def step_stats(results: list[dict], total: int, elapsed: float, label: str = ""):
-    """打印步骤统计并返回 {status: count}。"""
-    cnt = {s: sum(1 for r in results if r['status'] == s)
-           for s in ('success', 'skipped', 'failed')}
-    tag = f"[{label}] " if label else ""
-    print(f"\n{SEP}\n📊 {tag}{total}个 → ✅{cnt['success']} ⏭{cnt['skipped']} ❌{cnt['failed']}"
-          f"  ⏱{elapsed:.0f}s\n{SEP}")
-    if cnt['failed']:
-        print("❌ 失败项:")
-        for r in results:
-            if r['status'] == 'failed':
-                print(f"   - {os.path.basename(r['video_path'])}: {r.get('message', '?')}")
-    return cnt
 
 
 # ═══════════════════════════════════════════════════════
@@ -181,33 +128,7 @@ def _map_to_output_videos(originals: list[str], input_dir: str,
     return videos, mapping
 
 
-def _step_videos(video_files: list[str], step: str, mode: str,
-                 input_dir: str, output_dir: str, config: dict,
-                 tracker: ProcessingTracker) -> tuple[list[str] | None, str, dict[str, str]]:
-    """筛选需要执行此步骤的文件。返回 (paths, input_dir, {path→original}) 或全 None。"""
-    needed = MODE_STEPS.get(mode, ALL_STEPS)
 
-    if step not in needed:
-        for vf in video_files:
-            if tracker.get_step_status(vf, step) not in ('done', 'skipped'):
-                tracker.mark_step_skipped(vf, step, reason=f'{mode} 模式不需要此步骤')
-        tracker.save()
-        return None, "", {}
-
-    work = [v for v in video_files
-            if not tracker.is_step_synced(v, step, cache_path(v, output_dir, input_dir), output_dir)]
-    if not work:
-        return None, "", {}
-
-    if step in USE_OUTPUT_VIDEO and mode != 'tts_from_srt':
-        copies, mapping = _map_to_output_videos(work, input_dir, output_dir, config)
-        if copies:
-            # 始终用原始英文路径 → cache_dir 统一为英文名，TTS / Merge 一致
-            orig_paths = [mapping[c] for c in copies]
-            return (orig_paths, output_dir, mapping)
-        return (work, input_dir, {v: v for v in work})
-
-    return work, input_dir, {v: v for v in work}
 
 
 def _print_progress(video_files: list[str], tracker: ProcessingTracker, mode: str):
@@ -340,7 +261,7 @@ def _review_prompt(video_files: list[str], input_dir: str,
 
 def main(input_path: str = DEFAULT_INPUT, output_dir: str = DEFAULT_OUTPUT,
          mode: str = DEFAULT_MODE, skip_llm_fix: bool = False):
-    """9 步顺序管道：每步全量完成后推进，双校验（tracker+磁盘）自动断点续跑。"""
+    """单视频串行管道：每个视频依次走完 9 步后再处理下一个，双校验（tracker+磁盘）自动断点续跑。"""
 
     # ── 日志 ──
     logger.remove()
@@ -389,46 +310,86 @@ def main(input_path: str = DEFAULT_INPUT, output_dir: str = DEFAULT_OUTPUT,
 
     # ── 配置 ──
     config = load_config()
-    workers = config.get('global', {}).get('max_concurrency', {}).get('video_processor', 2)
-    logger.info(f"mode={mode} workers={workers} "
-                f"device={config.get('asr', {}).get('device', 'cpu')}")
+    logger.info(f"mode={mode} device={config.get('asr', {}).get('device', 'cpu')} "
+                f"(串行模式：每个视频独立完成全部步骤)")
     if sys.platform == 'darwin':
         multiprocessing.set_start_method('spawn', force=True)
 
     # ═══════════════════════════════════════════════════
-    #  9 步骤管道
+    #  单视频串行管道：每个视频走完所有步骤再处理下一个
     # ═══════════════════════════════════════════════════
     total_t, review = 0.0, False
     needed = MODE_STEPS.get(mode, ALL_STEPS)
 
-    for idx, step in enumerate(ALL_STEPS, 1):
-        step_vids, inp_dir, v2orig = _step_videos(
-            video_files, step, mode, input_path, output_dir, config, tracker)
+    for video_idx, video_path in enumerate(video_files, 1):
+        vf_name = Path(video_path).name
+        if len(video_files) > 1:
+            print(f"\n{WIDE}\n🎬 [{video_idx}/{len(video_files)}] {vf_name}\n{WIDE}")
 
-        if step_vids is None:
-            print(f"[{idx}/9] {STEP_LABELS[step]}: 全部跳过 ({len(video_files)})")
-            continue
+        for idx, step in enumerate(ALL_STEPS, 1):
+            # ── 模式不需要的步骤 → 标记跳过 ──
+            if step not in needed:
+                if tracker.get_step_status(video_path, step) not in ('done', 'skipped'):
+                    tracker.mark_step_skipped(video_path, step, reason=f'{mode} 模式不需要此步骤')
+                    tracker.save()
+                continue
 
-        print(f"\n{SEP}\n[{idx}/9] {STEP_LABELS[step]} — {len(step_vids)}/{len(video_files)} 文件\n{SEP}")
-        results, dt = batch_run(step_vids, config, STEP_SUBSTEP[step],
-                                inp_dir, output_dir, skip_llm_fix, workers, STEP_LABELS[step])
-        total_t += dt
-        cnt = step_stats(results, len(step_vids), dt, STEP_LABELS[step])
+            # ── 双重校验：tracker + 磁盘缓存 → 跳过已完成步骤 ──
+            if tracker.is_step_synced(video_path, step,
+                                       cache_path(video_path, output_dir, input_path),
+                                       output_dir):
+                if len(video_files) > 1:
+                    print(f"  [{idx}/9] {STEP_LABELS[step]}: ⏭️ 跳过")
+                continue
 
-        # 更新 tracker
-        for r in results:
-            orig = v2orig.get(r['video_path'], r['video_path'])
-            match r['status']:
-                case 'success':  tracker.mark_step_done(orig, step, output_name=r.get('output_name'),
-                                                        duration_seconds=r.get('elapsed'))
-                case 'failed':   tracker.mark_step_failed(orig, step, message=r.get('message', ''))
-                case 'skipped':  tracker.mark_step_skipped(orig, step, reason=r.get('message', ''))
-        tracker.save()
+            # ── 确定工作路径（tts_prep/tts_generate 需用输出目录中的视频）──
+            work_video = video_path
+            work_input_dir = input_path
 
-        # 审核拦截：tts_with_review 在 srt 完成后暂停
-        if mode == 'tts_with_review' and step == 'srt' and cnt['success'] > 0:
-            _review_prompt(video_files, input_path, output_dir, config, tracker)
-            review = True
+            if step in USE_OUTPUT_VIDEO and mode != 'tts_from_srt':
+                copies, mapping = _map_to_output_videos([video_path], input_path,
+                                                         output_dir, config)
+                if copies:
+                    work_video = mapping[copies[0]]
+                    work_input_dir = output_dir
+
+            # ── 执行步骤 ──
+            print(f"\n  [{idx}/9] {STEP_LABELS[step]}: {vf_name}")
+            t0 = time.time()
+            result = process_substep(work_video, config, STEP_SUBSTEP[step],
+                                     work_input_dir, output_dir, skip_llm_fix)
+            dt = time.time() - t0
+            total_t += dt
+
+            # ── 更新追踪器 ──
+            match result['status']:
+                case 'success':
+                    tracker.mark_step_done(video_path, step,
+                                           output_name=result.get('output_name'),
+                                           duration_seconds=result.get('elapsed'))
+                    print(f"  ✅ 完成 ({result.get('elapsed', dt):.0f}s)")
+                case 'failed':
+                    tracker.mark_step_failed(video_path, step,
+                                             message=result.get('message', ''))
+                    print(f"  ❌ 失败: {result.get('message', '?')}")
+                case 'skipped':
+                    tracker.mark_step_skipped(video_path, step,
+                                              reason=result.get('message', ''))
+                    print(f"  ⏭️ 跳过: {result.get('message', '')}")
+            tracker.save()
+
+            # ── 审核模式：srt 完成后打印审核提示 ──
+            if mode == 'tts_with_review' and step == 'srt' and result['status'] == 'success':
+                _review_prompt([video_path], input_path, output_dir, config, tracker)
+                review = True
+
+        # ── 单视频完成状态 ──
+        v_done = all(tracker.get_step_status(video_path, s) == 'done' for s in needed)
+        v_failed = any(tracker.get_step_status(video_path, s) == 'failed' for s in ALL_STEPS)
+        if v_done and len(video_files) > 1:
+            print(f"  ✅ 视频完成: {vf_name}")
+        elif v_failed and len(video_files) > 1:
+            print(f"  ❌ 视频有失败步骤: {vf_name}")
 
     # ═══════════════════════════════════════════════════
     #  最终统计
@@ -459,8 +420,8 @@ if __name__ == "__main__":
     #'tts_with_review': '带审核的配音（ASR→翻译→字幕→审核→TTS→合成）',
     PRESET = {
         "input": "/Volumes/mvp/[00]交易场/Mulham Trading/Full Trading Courses",
-        "output": "/Volumes/mvp/[00]交易场/Mulham Trading/Full Trading Courses/output",
-        "mode": "tts_no_subtitle "
+        "output": "/Volumes/mvp/[00]交易场/Mulham Trading/Full Trading Courses-output",
+        "mode": "tts_no_subtitle"
     }
 
     parser = argparse.ArgumentParser(description='统一视频处理工具 — 9 步管道')

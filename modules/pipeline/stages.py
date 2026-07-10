@@ -551,6 +551,12 @@ def tts_generate_only(video_path, cache_dir, config):
         segments, output_dir=tts_output_dir, config=config['tts']
     ))
 
+    # 写回更新后的时间轴到 tts_preprocessed.json，确保下一步 merge_only
+    # 中 generate_srt 拿到的是 TTS 对齐后的 start/end 时间戳
+    with open(prepped_cache_path, 'w', encoding='utf-8') as f:
+        _json.dump(segments, f, ensure_ascii=False, indent=2)
+    logger.info(f"TTS 对齐后的时间轴已写回: {prepped_cache_path}")
+
     logger.success(f"TTS 语音生成完成: {tts_audio}")
     return {'tts_audio': tts_audio}
 

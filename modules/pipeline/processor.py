@@ -284,7 +284,8 @@ def process_video_unified(video_path, config, mode='tts_no_subtitle',
                 _json.dump(translated_results, _f, ensure_ascii=False, indent=2)
 
         # ── Phase 4: 生成 SRT 文件 ──
-        if mode in ['tts_no_subtitle', 'tts_with_review']:
+        # tts_with_review 模式：在此生成 SRT 供人工审核
+        if mode == 'tts_with_review':
             logger.info("\n[STEP 6/6] 生成 SRT 字幕（中文 / 原始语言 / 双语）...")
             srt_path = generate_all_srt_files(
                 fused_results=fused_results,
@@ -295,8 +296,6 @@ def process_video_unified(video_path, config, mode='tts_no_subtitle',
             )
             logger.success(f"SRT 字幕生成完成: {srt_path}")
 
-        # ── tts_with_review：复制视频到输出目录 ──
-        if mode == 'tts_with_review':
             # 将原始视频复制到输出目录，使用翻译后的名字，与 SRT 保持同名同目录
             original_ext = os.path.splitext(video_path)[1]
             copied_video = os.path.join(target_output_dir, f"{output_base_name}{original_ext}")
@@ -315,16 +314,29 @@ def process_video_unified(video_path, config, mode='tts_no_subtitle',
                 'message': '字幕已生成，等待人工审核（修正 SRT 后使用 --mode tts_from_srt 继续）'
             }
 
-        # ── Phase 5: TTS + 合并（tts_no_subtitle） ──
+        # ── Phase 5: TTS + 合并 + 对齐 SRT（tts_no_subtitle） ──
         if mode == 'tts_no_subtitle':
             if translated_results is None:
                 logger.error("TTS 模式需要翻译结果，但未找到")
                 raise RuntimeError("翻译步骤缺失")
 
+            # TTS 会原地修改 translated_results 中每个 segment 的 start/end
+            # 更新为对齐后的时间轴（含 gap 压缩）
             tts_audio = tts_stage(translated_results, cache_dir, config)
             final_video = merge_stage(
                 video_path, tts_audio, target_output_dir, config, output_base_name
             )
+
+            # 在 TTS 之后重新生成 SRT，使用对齐后的时间轴，确保音字同步
+            logger.info("\n[生成对齐 SRT] TTS 时间轴对齐后重新生成字幕...")
+            srt_path = generate_all_srt_files(
+                fused_results=fused_results,
+                translated_results=translated_results,
+                output_dir=target_output_dir,
+                base_name=output_base_name,
+                source_is_chinese=_source_is_chinese
+            )
+            logger.success(f"对齐版 SRT 字幕生成完成: {srt_path}")
 
         logger.info(f"{'='*60}")
         logger.success(f"视频 [{output_base_name}] 处理完成！")

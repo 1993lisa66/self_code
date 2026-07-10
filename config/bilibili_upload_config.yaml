@@ -1,0 +1,89 @@
+# ═══════════════════════════════════════════════════════════════
+# 哔哩哔哩视频合集上传配置文件
+# ═══════════════════════════════════════════════════════════════
+# 使用方法:
+#   python bilibili_upload_cli.py --config config/bilibili_upload_config.yaml
+#
+# 命令行参数会覆盖此配置文件的对应值（命令行优先级更高）
+# ═══════════════════════════════════════════════════════════════
+
+# ── Cookie 认证 ──
+cookies: "www.bilibili.com_cookies.txt"   # Cookie 文件路径（Netscape 格式）
+
+# ── 上传控制 ──
+upload:
+  # 视频文件目录（扫描此目录下所有视频文件）
+  video_dir: "/path/to/your/videos"
+
+  # 允许上传的视频扩展名
+  extensions: ".mp4,.flv,.avi,.mkv,.mov,.wmv"
+
+  # 单文件最大重试次数
+  max_retries: 3
+
+  # 重试间隔（秒），对应第1/2/3次重试
+  retry_delays: "5,15,30"
+
+  # 断点续传状态文件
+  # 上传成功的文件会记录在此，中断后重新运行会跳过已完成的
+  state_file: "logs/upload_state.json"
+
+# ── 合集配置 ──
+collection:
+  title: "我的视频合集"                     # 合集标题（必填）
+  description: "合集简介描述"               # 合集描述
+  cover: ""                                 # 合集封面图片路径（可选）
+  tags:                                     # 合集标签（可选）
+    - "教程"
+    - "编程"
+
+# ── 视频元数据（所有视频共用的默认值） ──
+video_meta:
+  # 分区ID
+  # 常用: 1=动画 4=游戏 160=生活 36=知识 181=影视 3=音乐 188=科技 207=财经 173=默认
+  tid: 173
+
+  # 标签（逗号分隔或列表）
+  tags:
+    - "默认标签1"
+    - "默认标签2"
+
+  # 通用描述（会应用到所有视频）
+  description: ""
+
+  # 转载来源（留空则=自制原创）
+  source: ""
+
+  # 默认封面
+  cover: ""
+
+# ── 单个视频配置（可选） ──
+# 如果需要对不同视频设置不同标题/描述/标签，在此列表指定
+# 未列出的视频会自动使用文件名作为标题 + video_meta 的默认值
+videos:
+  # - file_path: "/path/to/videos/第一集.mp4"
+  #   title: "第一集：入门基础"
+  #   description: "入门基础课程详解"
+  #   tags:
+  #     - "入门"
+  #     - "基础"
+  #   tid: 173
+  #   cover_path: ""
+  #   source: ""
+  #   order: 1
+  #
+  # - file_path: "/path/to/videos/第二集.mp4"
+  #   title: "第二集：进阶技巧"
+  #   description: "高级功能详解"
+  #   tags:
+  #     - "进阶"
+  #     - "技巧"
+  #   tid: 173
+  #   cover_path: ""
+  #   source: ""
+  #   order: 2
+
+# ── 日志配置 ──
+logging:
+  file: "logs/bilibili_upload.log"          # 上传日志文件
+  report: "logs/upload_report.json"         # 上传报告（JSON 格式）

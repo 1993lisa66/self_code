@@ -109,6 +109,8 @@ def merge_audio_with_pydub(temp_files, output_path):
         
         # 初始化空白音频 (44.1kHz, 16-bit, Stereo)
         combined = AudioSegment.silent(duration=0, frame_rate=44100)
+        # 记录前一个片段是否为音频（非静音），用于决定是否 crossfade
+        prev_is_audio = False
         
         for seg, path in sorted_files:
             if seg.get('is_gap'):
@@ -116,6 +118,7 @@ def merge_audio_with_pydub(temp_files, output_path):
                 duration_ms = int((seg['end'] - seg['start']) * 1000)
                 if duration_ms > 0:
                     combined += AudioSegment.silent(duration=duration_ms, frame_rate=44100)
+                prev_is_audio = False
             elif path and os.path.exists(path):
                 # 处理 TTS 片段
                 try:
@@ -126,12 +129,20 @@ def merge_audio_with_pydub(temp_files, output_path):
                     if segment_audio.channels != 2:
                         segment_audio = segment_audio.set_channels(2)
                     
-                    combined += segment_audio
+                    # 交叉淡化：当前音频与前一个音频片段做 60ms 淡入淡出，
+                    # 消除 TTS 片段衔接处的生硬切割感
+                    if prev_is_audio and len(combined) > 0 and len(segment_audio) > 60:
+                        fade_duration = min(60, len(combined), len(segment_audio))
+                        combined = combined.append(segment_audio, crossfade=fade_duration)
+                    else:
+                        combined += segment_audio
+                    prev_is_audio = True
                 except Exception as e:
                     logger.warning(f"加载音频片段失败 {path}: {e}")
                     # 失败则补充对应时长的静音，维持时间轴同步
                     duration_ms = int((seg['end'] - seg['start']) * 1000)
                     combined += AudioSegment.silent(duration=duration_ms, frame_rate=44100)
+                    prev_is_audio = False
         
         # 导出为高质量 MP3
         combined.export(output_path, format="mp3", bitrate="192k")
@@ -297,7 +308,20 @@ async def generate_tts(translated_results, output_dir="cache/tts", voice=None, c
         # 计算与前一片段的原始间隙 (Gap)
         orig_start = seg['start']
         prev_orig_end = temp_files_to_merge[i-1][0]['end'] if i > 0 else 0.0
-        gap = max(0, orig_start - prev_orig_end)
+        raw_gap = max(0, orig_start - prev_orig_end)
+
+        # 优化：原始视频中句子间的长停顿在 TTS 听感上非常突兀
+        # 对 gap 做衰减：保留自然停顿节奏但大幅缩短静音时长
+        if raw_gap > 10.0:
+            gap = 0.8  # 超过 10 秒（场景切换）：最多 0.8 秒
+        elif raw_gap > 5.0:
+            gap = min(raw_gap * 0.15, 0.6)  # 5-10 秒：15% 衰减，上限 0.6 秒
+        elif raw_gap > 2.0:
+            gap = min(raw_gap * 0.2, 0.5)  # 2-5 秒：20% 衰减，上限 0.5 秒
+        elif raw_gap > 1.0:
+            gap = min(raw_gap * 0.3, 0.4)  # 1-2 秒：30% 衰减，上限 0.4 秒
+        else:
+            gap = raw_gap * 0.4  # < 1 秒：40% 衰减，保留轻微停顿
         
         # 1. 记录静音间隙：不再生成临时文件，由 Pydub 在合成时统一处理
         if gap > 0.01:

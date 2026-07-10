@@ -4,6 +4,8 @@
 import sys, logging
 from pathlib import Path
 
+import time
+
 from modules.bilibili.config import PROJECT_ROOT, LOG_FILE, set_output_dir, _get
 from modules.bilibili.utils import is_playlist_url
 from modules.bilibili.downloader import BilibiliDownloader, download_collection_as_individuals
@@ -38,8 +40,16 @@ def main(url: str, output: str = "", quality: str = "", download_mode: str = "")
 
 
 if __name__ == "__main__":
-    # 在这里设置要下载的视频链接和输出路径
-    url = "https://space.bilibili.com/40201146/lists/8467061?type=season"
+    # 在这里设置要下载的视频链接列表和输出路径
+    urls = [
+        # "https://space.bilibili.com/3546745753569476/lists/6988232?type=season",
+        # "https://space.bilibili.com/3546745753569476/lists/7307126?type=season",
+        # "https://space.bilibili.com/188071007/lists/4397211?type=season",
+        "https://space.bilibili.com/3546745753569476/lists/7560000?type=season",
+    ]
     output = "/Volumes/mvp/[00]交易场"
 
-    main(url, output)
+    for idx, url in enumerate(urls, 1):
+        logger.info(f"正在处理第 {idx}/{len(urls)} 个链接: {url}")
+        main(url, output)
+        time.sleep(120)

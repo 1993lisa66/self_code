@@ -15,7 +15,7 @@ global:
     video_processor: 1
 llm:
   api_base: https://api.siliconflow.cn/v1
-  api_key: sk-pyxmrlxwmhgcvztkwmudjoyyypnbvwbkoctfixqqhcojeufg
+  api_key: sk-ciflsfsoebgnuzsyhsuciwgvqvqosjkasdtsvphzxwttjqmt
   model: deepseek-ai/DeepSeek-V3
   fallback_model: deepseek-ai/DeepSeek-V3
   default_request_timeout: 120
